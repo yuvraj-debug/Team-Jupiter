@@ -36,7 +36,7 @@ const config = {
     botToken: process.env.BOT_TOKEN,
     guildId: process.env.GUILD_ID,
     adminIds: ['1212047208673837087', '1202998273376522331'], // Admin user IDs
-    ticketViewerRoleId: '1414824820901679155', // Role that can view open tickets
+    ticketViewerRoleId: '1414824820901679155', // Role that can view and manage tickets
     mentionRoleName: 'Mention Permissions', // Role that allows mentioning @everyone and roles
     securityRoleName: 'Security Admin' // Role for security permissions
 };
@@ -140,6 +140,23 @@ async function logAction(action, details, color = 0x0099FF, user = null) {
             console.error('Error sending log to channel:', error);
         }
     }
+}
+
+// Check if user has ticket management permissions
+function hasTicketPermission(member, ticketData = null) {
+    // Admins always have permission
+    if (config.adminIds.includes(member.id)) return true;
+    
+    // Check if user has the ticket manager role
+    if (member.roles.cache.has(config.ticketViewerRoleId)) return true;
+    
+    // Ticket creator can manage their own ticket
+    if (ticketData && ticketData.creator === member.id) return true;
+    
+    // User who claimed the ticket can manage it
+    if (ticketData && ticketData.claimedBy === member.id) return true;
+    
+    return false;
 }
 
 // Create or get mention permission role
@@ -256,8 +273,8 @@ client.on(Events.GuildMemberAdd, async (member) => {
         
         const welcomeEmbed = new EmbedBuilder()
             .setColor(0x00FF00)
-            .setTitle('🎉 Welcome to Team Jupiter! 🎉')
-            .setDescription(`${member.user}, :wave: hey! welcome to **Team Jupiter**, the ultimate gaming experience!\nWe hope you enjoy your stay and have an amazing time here. Make sure to check out the community and get involved!\n\n:sword: **Team Jupiter**`)
+            .setTitle('🎉 Welcome to Elite Clan! 🎉')
+            .setDescription(`${member.user}, :wave: hey! welcome to **Elite Clan**, the ultimate gaming experience!\nWe hope you enjoy your stay and have an amazing time here. Make sure to check out the community and get involved!\n\n:sword: **Elite Clan**`)
             .setThumbnail(member.user.displayAvatarURL())
             .setImage('https://images-ext-1.discordapp.net/external/1vFDeXmdRWn_3XIfN2wncqUh5FRIRmfPmXOPiczCvRw/https/i.pinimg.com/736x/a9/eb/a3/a9eba3be002462632df36598cf737e53.jpg?format=webp&width=828&height=466')
             .setFooter({ text: `Member #${member.guild.memberCount}`, iconURL: member.guild.iconURL() })
@@ -371,7 +388,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
                     id: ticketViewerRole.id,
                     allow: [
                         PermissionsBitField.Flags.ViewChannel,
-                        PermissionsBitField.Flags.ReadMessageHistory
+                        PermissionsBitField.Flags.SendMessages,
+                        PermissionsBitField.Flags.ReadMessageHistory,
+                        PermissionsBitField.Flags.ManageMessages,
+                        PermissionsBitField.Flags.ManageChannels
                     ]
                 });
             }
@@ -468,12 +488,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     
     // Ticket management buttons
-    if (interaction.customId === 'claim_ticket' || interaction.customId === 'lock_ticket' || interaction.customId === 'delete_ticket') {
+    if (interaction.customId === 'claim_ticket' || interaction.customId === 'lock_ticket' || interaction.customId === 'unlock_ticket' || interaction.customId === 'delete_ticket') {
         const ticketData = data.tickets.get(interaction.channel.id);
-        if (!ticketData) return;
+        if (!ticketData) {
+            await interaction.reply({ 
+                content: '❌ This is not a valid ticket channel.', 
+                ephemeral: true 
+            });
+            return;
+        }
         
         // Check if user has permission to manage tickets
-        if (!config.adminIds.includes(interaction.user.id) && interaction.user.id !== ticketData.creator) {
+        if (!hasTicketPermission(interaction.member, ticketData)) {
             await interaction.reply({ 
                 content: '❌ You do not have permission to manage this ticket.', 
                 ephemeral: true 
@@ -529,8 +555,102 @@ client.on(Events.InteractionCreate, async (interaction) => {
             const currentName = interaction.channel.name;
             await interaction.channel.setName(`🔒 ${currentName.replace(/^(✅ |🔒 )/, '')}`);
             
+            // Update buttons - remove lock, add unlock
+            const claimButton = new ButtonBuilder()
+                .setCustomId('claim_ticket')
+                .setLabel('Claim')
+                .setStyle(ButtonStyle.Success)
+                .setEmoji('✅')
+                .setDisabled(true);
+                
+            const unlockButton = new ButtonBuilder()
+                .setCustomId('unlock_ticket')
+                .setLabel('Unlock')
+                .setStyle(ButtonStyle.Secondary)
+                .setEmoji('🔓');
+                
+            const deleteButton = new ButtonBuilder()
+                .setCustomId('delete_ticket')
+                .setLabel('Delete')
+                .setStyle(ButtonStyle.Danger)
+                .setEmoji('🗑️');
+                
+            const row = new ActionRowBuilder().addComponents(claimButton, unlockButton, deleteButton);
+            
+            // Update the message with new buttons
+            const messages = await interaction.channel.messages.fetch();
+            const ticketMessage = messages.find(m => m.embeds.length > 0 && m.embeds[0].title === '🎫 Ticket Created');
+            
+            if (ticketMessage) {
+                const embed = ticketMessage.embeds[0];
+                const updatedEmbed = EmbedBuilder.from(embed)
+                    .setDescription(embed.description.replace('🟢 Open', '🔴 Locked'));
+                
+                await ticketMessage.edit({ embeds: [updatedEmbed], components: [row] });
+            }
+            
             await interaction.reply(`🔒 Ticket locked by ${interaction.user}`);
             await logAction('TICKET_LOCK', `${interaction.user.tag} locked ticket in ${interaction.channel.name}`, 0xFFA500, interaction.user);
+        }
+        
+        if (interaction.customId === 'unlock_ticket') {
+            if (!ticketData.locked) {
+                await interaction.reply({ 
+                    content: '❌ This ticket is not locked.', 
+                    ephemeral: true 
+                });
+                return;
+            }
+            
+            ticketData.locked = false;
+            data.tickets.set(interaction.channel.id, ticketData);
+            
+            await interaction.channel.permissionOverwrites.edit(ticketData.creator, {
+                ViewChannel: true,
+                SendMessages: true,
+                ReadMessageHistory: true
+            });
+            
+            // Remove 🔒 emoji from the channel name
+            const currentName = interaction.channel.name;
+            await interaction.channel.setName(currentName.replace(/^🔒 /, ''));
+            
+            // Update buttons - add lock, remove unlock
+            const claimButton = new ButtonBuilder()
+                .setCustomId('claim_ticket')
+                .setLabel('Claim')
+                .setStyle(ButtonStyle.Success)
+                .setEmoji('✅')
+                .setDisabled(!!ticketData.claimedBy);
+                
+            const lockButton = new ButtonBuilder()
+                .setCustomId('lock_ticket')
+                .setLabel('Lock')
+                .setStyle(ButtonStyle.Secondary)
+                .setEmoji('🔒');
+                
+            const deleteButton = new ButtonBuilder()
+                .setCustomId('delete_ticket')
+                .setLabel('Delete')
+                .setStyle(ButtonStyle.Danger)
+                .setEmoji('🗑️');
+                
+            const row = new ActionRowBuilder().addComponents(claimButton, lockButton, deleteButton);
+            
+            // Update the message with new buttons
+            const messages = await interaction.channel.messages.fetch();
+            const ticketMessage = messages.find(m => m.embeds.length > 0 && m.embeds[0].title === '🎫 Ticket Created');
+            
+            if (ticketMessage) {
+                const embed = ticketMessage.embeds[0];
+                const updatedEmbed = EmbedBuilder.from(embed)
+                    .setDescription(embed.description.replace('🔴 Locked', '🟢 Open'));
+                
+                await ticketMessage.edit({ embeds: [updatedEmbed], components: [row] });
+            }
+            
+            await interaction.reply(`🔓 Ticket unlocked by ${interaction.user}`);
+            await logAction('TICKET_UNLOCK', `${interaction.user.tag} unlocked ticket in ${interaction.channel.name}`, 0x00FF00, interaction.user);
         }
         
         if (interaction.customId === 'delete_ticket') {
@@ -538,11 +658,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
             ticketData.closed = true;
             data.tickets.set(interaction.channel.id, ticketData);
             
+            // Acknowledge the interaction immediately
+            await interaction.deferReply();
+            
             // Create transcript before deletion
-            const messages = await interaction.channel.messages.fetch();
-            const transcript = messages.map(msg => 
-                `[${msg.createdAt.toLocaleString()}] ${msg.author.tag} (${msg.author.id}): ${msg.content}${msg.attachments.size > 0 ? ` [Attachment: ${msg.attachments.first().name}]` : ''}`
-            ).reverse().join('\n');
+            let transcript = '';
+            try {
+                const messages = await interaction.channel.messages.fetch({ limit: 100 });
+                transcript = messages.map(msg => 
+                    `[${msg.createdAt.toLocaleString()}] ${msg.author.tag} (${msg.author.id}): ${msg.content}${msg.attachments.size > 0 ? ` [Attachment: ${msg.attachments.first().name}]` : ''}`
+                ).reverse().join('\n');
+            } catch (transcriptError) {
+                console.error('Error creating transcript:', transcriptError);
+                transcript = 'Failed to create transcript';
+            }
             
             // Send closure DM to user
             try {
@@ -569,8 +698,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
                         name: `ticket-${interaction.channel.name}-transcript.txt`
                     }]
                 });
-            } catch (error) {
-                console.error('Could not send DM to user:', error);
+            } catch (dmError) {
+                console.error('Could not send DM to user:', dmError);
             }
             
             // Log to ticket log channel
@@ -917,7 +1046,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.isCommand()) return;
     
     // Check if user is authorized to use commands
-    if (!config.adminIds.includes(interaction.user.id)) {
+    if (!config.adminIds.includes(interaction.user.id) && !interaction.member.roles.cache.has(config.ticketViewerRoleId)) {
         await interaction.reply({ 
             content: '❌ You are not authorized to use this command.', 
             ephemeral: true 
@@ -1195,8 +1324,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         try {
             const welcomeEmbed = new EmbedBuilder()
                 .setColor(0x00FF00)
-                .setTitle('🎉 Welcome to Team Jupiter! 🎉')
-                .setDescription(`${interaction.user}, :wave: hey! welcome to **Team Jupiter**, the ultimate gaming experience!\nWe hope you enjoy your stay and have an amazing time here. Make sure to check out the community and get involved!\n\n:sword: **Team Jupiter**`)
+                .setTitle('🎉 Welcome to Elite Clan! 🎉')
+                .setDescription(`${interaction.user}, :wave: hey! welcome to **Elite Clan**, the ultimate gaming experience!\nWe hope you enjoy your stay and have an amazing time here. Make sure to check out the community and get involved!\n\n:sword: **Elite Clan**`)
                 .setThumbnail(interaction.user.displayAvatarURL())
                 .setImage('https://images-ext-1.discordapp.net/external/1vFDeXmdRWn_3XIfN2wncqUh5FRIRmfPmXOPiczCvRw/https/i.pinimg.com/736x/a9/eb/a3/a9eba3be002462632df36598cf737e53.jpg?format=webp&width=828&height=466')
                 .setFooter({ text: `Member #${interaction.guild.memberCount}`, iconURL: interaction.guild.iconURL() })
