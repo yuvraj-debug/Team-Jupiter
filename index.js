@@ -273,8 +273,8 @@ client.on(Events.GuildMemberAdd, async (member) => {
         
         const welcomeEmbed = new EmbedBuilder()
             .setColor(0x00FF00)
-            .setTitle('🎉 Welcome to Elite Clan! 🎉')
-            .setDescription(`${member.user}, :wave: hey! welcome to **Elite Clan**, the ultimate gaming experience!\nWe hope you enjoy your stay and have an amazing time here. Make sure to check out the community and get involved!\n\n:sword: **Elite Clan**`)
+            .setTitle('🎉 Welcome to Team Jupiter! 🎉')
+            .setDescription(`${member.user}, :wave: hey! welcome to **Team Jupiter**, the ultimate gaming experience!\nWe hope you enjoy your stay and have an amazing time here. Make sure to check out the community and get involved!\n\n:sword: **Team Jupiter**`)
             .setThumbnail(member.user.displayAvatarURL())
             .setImage('https://images-ext-1.discordapp.net/external/1vFDeXmdRWn_3XIfN2wncqUh5FRIRmfPmXOPiczCvRw/https/i.pinimg.com/736x/a9/eb/a3/a9eba3be002462632df36598cf737e53.jpg?format=webp&width=828&height=466')
             .setFooter({ text: `Member #${member.guild.memberCount}`, iconURL: member.guild.iconURL() })
@@ -1249,7 +1249,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             .setColor(0x0099FF)
             .setTitle('🎫 Support Ticket System')
             .setDescription('**Click The Below Button To Open Ticket**\n\n🔥 **General Support**\n💜 **Team Apply**\n🤝 **Ally/Merge**\n\n*Note: Don\'t make ticket for fun = 1 day timeout + Noted For Future*')
-            .setFooter({ text: 'Elite Clan Support System', iconURL: interaction.guild.iconURL() })
+            .setFooter({ text: 'Team Jupiter Support System', iconURL: interaction.guild.iconURL() })
             .setTimestamp();
             
         const generalButton = new ButtonBuilder()
@@ -1324,8 +1324,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         try {
             const welcomeEmbed = new EmbedBuilder()
                 .setColor(0x00FF00)
-                .setTitle('🎉 Welcome to Elite Clan! 🎉')
-                .setDescription(`${interaction.user}, :wave: hey! welcome to **Elite Clan**, the ultimate gaming experience!\nWe hope you enjoy your stay and have an amazing time here. Make sure to check out the community and get involved!\n\n:sword: **Elite Clan**`)
+                .setTitle('🎉 Welcome to Team Jupiter! 🎉')
+                .setDescription(`${interaction.user}, :wave: hey! welcome to **Team Jupiter**, the ultimate gaming experience!\nWe hope you enjoy your stay and have an amazing time here. Make sure to check out the community and get involved!\n\n:sword: **Team Jupiter**`)
                 .setThumbnail(interaction.user.displayAvatarURL())
                 .setImage('https://images-ext-1.discordapp.net/external/1vFDeXmdRWn_3XIfN2wncqUh5FRIRmfPmXOPiczCvRw/https/i.pinimg.com/736x/a9/eb/a3/a9eba3be002462632df36598cf737e53.jpg?format=webp&width=828&height=466')
                 .setFooter({ text: `Member #${interaction.guild.memberCount}`, iconURL: interaction.guild.iconURL() })
@@ -1386,7 +1386,7 @@ client.on(Events.ClientReady, async () => {
     console.log(`✅ Logged in as ${client.user.tag}!`);
     
     // Set bot status
-    client.user.setActivity('Elite Clan', { type: 'WATCHING' });
+    client.user.setActivity('Team Jupiter', { type: 'WATCHING' });
     
     // Setup security roles
     if (config.guildId) {
