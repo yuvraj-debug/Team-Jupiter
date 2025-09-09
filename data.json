@@ -1,0 +1,13 @@
+{
+  "whitelistedUsers": [],
+  "enabledFeatures": {
+    "linkBlocking": true,
+    "securityMode": true,
+    "antiSpam": true,
+    "antiRaid": true,
+    "antiNuke": true,
+    "massMentionProtection": true,
+    "inviteProtection": true
+  },
+  "warnedUsers": {}
+}

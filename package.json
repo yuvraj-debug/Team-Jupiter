@@ -1,0 +1,28 @@
+{
+  "name": "elite-clan-bot",
+  "version": "1.0.0",
+  "description": "Discord bot for Elite Clan server",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.22.1",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2"
+  },
+  "engines": {
+    "node": ">=16.9.0"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "moderation"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  }
+}
