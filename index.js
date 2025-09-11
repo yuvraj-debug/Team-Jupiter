@@ -28,6 +28,13 @@ const whitelistSchema = new mongoose.Schema({
   timestamp: { type: Date, default: Date.now }
 });
 
+const immuneSchema = new mongoose.Schema({
+  userId: { type: String, required: true, unique: true },
+  addedBy: { type: String, required: true },
+  timestamp: { type: Date, default: Date.now },
+  reason: { type: String, default: 'No reason provided' }
+});
+
 const ticketSchema = new mongoose.Schema({
   channelId: { type: String, required: true, unique: true },
   creator: { type: String, required: true },
@@ -46,6 +53,7 @@ ticketSchema.index({ closedAt: 1 }, { expireAfterSeconds: 2592000 }); // 30 days
 
 const Warning = mongoose.model('Warning', warningSchema);
 const Whitelist = mongoose.model('Whitelist', whitelistSchema);
+const Immune = mongoose.model('Immune', immuneSchema);
 const Ticket = mongoose.model('Ticket', ticketSchema);
 
 // Keep-alive server for Render
@@ -387,6 +395,48 @@ async function removeFromWhitelist(userId) {
     }
 }
 
+// Check if user is immune
+async function isImmune(userId) {
+    try {
+        return await Immune.exists({ userId });
+    } catch (error) {
+        console.error('Error checking immune status:', error);
+        return false;
+    }
+}
+
+// Add user to immune list
+async function addToImmune(userId, addedBy, reason = 'No reason provided') {
+    try {
+        await Immune.create({ userId, addedBy, reason });
+        return true;
+    } catch (error) {
+        console.error('Error adding to immune list:', error);
+        return false;
+    }
+}
+
+// Remove user from immune list
+async function removeFromImmune(userId) {
+    try {
+        await Immune.deleteOne({ userId });
+        return true;
+    } catch (error) {
+        console.error('Error removing from immune list:', error);
+        return false;
+    }
+}
+
+// Get immune users
+async function getImmuneUsers() {
+    try {
+        return await Immune.find().populate('userId', 'username');
+    } catch (error) {
+        console.error('Error getting immune users:', error);
+        return [];
+    }
+}
+
 // Generate a unique warning ID
 function generateWarningId() {
     return Math.random().toString(36).substring(2, 10).toUpperCase();
@@ -395,6 +445,11 @@ function generateWarningId() {
 // Add warning to user
 async function addWarning(user, guild, reason, moderator) {
     try {
+        // Check if user is immune
+        if (await isImmune(user.id)) {
+            return { warnings: -1, warningId: null }; // -1 indicates immune user
+        }
+        
         const warningId = generateWarningId();
         
         await Warning.create({
@@ -1176,18 +1231,31 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const { commandName, options } = interaction;
     
     // Special handling for whitelist command - only allow specific users
-    if (commandName === 'whitelist') {
+    if (commandName === 'whitelist' || commandName === 'immune') {
         // Check if user is one of the authorized users
         if (!config.authorizedUsers.includes(interaction.user.id)) {
             await interaction.reply({ 
                 content: '❌ You are not authorized to use this command.', 
                 ephemeral: true 
             });
-            await logAction('UNAUTHORIZED_COMMAND', `${interaction.user.tag} attempted to use /whitelist without authorization`, 0xFF0000, interaction.user);
+            await logAction('UNAUTHORIZED_COMMAND', `${interaction.user.tag} attempted to use /${commandName} without authorization`, 0xFF0000, interaction.user);
             return;
         }
-        
-        // Proceed with the command if authorized
+    }
+    
+    // For all other commands, use the existing permission check
+    if (commandName !== 'whitelist' && commandName !== 'immune') {
+        // Check if user is authorized to use commands (existing logic)
+        if (!config.adminIds.includes(interaction.user.id) && !interaction.member.roles.cache.has(config.ticketViewerRoleId)) {
+            await interaction.reply({ 
+                content: '❌ You are not authorized to use this command.', 
+                ephemeral: true 
+            });
+            return;
+        }
+    }
+    
+    if (commandName === 'whitelist') {
         const user = options.getUser('user');
         if (user) {
             const success = await addToWhitelist(user.id, interaction.user.id);
@@ -1210,18 +1278,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
     }
     
-    // For all other commands, use the existing permission check
-    if (commandName !== 'whitelist') {
-        // Check if user is authorized to use commands (existing logic)
-        if (!config.adminIds.includes(interaction.user.id) && !interaction.member.roles.cache.has(config.ticketViewerRoleId)) {
-            await interaction.reply({ 
-                content: '❌ You are not authorized to use this command.', 
-                ephemeral: true 
-            });
-            return;
-        }
-    }
-    
     if (commandName === 'unwhitelist') {
         const user = options.getUser('user');
         if (user) {
@@ -1239,6 +1295,62 @@ client.on(Events.InteractionCreate, async (interaction) => {
             } else {
                 await interaction.reply({ 
                     content: '❌ Failed to unwhitelist user.', 
+                    ephemeral: true 
+                });
+            }
+        }
+    }
+    
+    if (commandName === 'immune') {
+        const user = options.getUser('user');
+        const reason = options.getString('reason') || 'No reason provided';
+        
+        if (user) {
+            const success = await addToImmune(user.id, interaction.user.id, reason);
+            
+            if (success) {
+                const embed = new EmbedBuilder()
+                    .setColor(0x00FF00)
+                    .setTitle('✅ User Made Immune')
+                    .setDescription(`${user.tag} is now immune to warnings.`)
+                    .addFields(
+                        { name: 'Reason', value: reason, inline: true },
+                        { name: 'Added By', value: interaction.user.tag, inline: true }
+                    )
+                    .setTimestamp();
+                    
+                await interaction.reply({ embeds: [embed] });
+                await logAction('IMMUNE_ADD', `${interaction.user.tag} made ${user.tag} immune to warnings`, 0x00FF00, interaction.user);
+            } else {
+                await interaction.reply({ 
+                    content: '❌ Failed to make user immune.', 
+                    ephemeral: true 
+                });
+            }
+        }
+    }
+    
+    if (commandName === 'unimmune') {
+        const user = options.getUser('user');
+        
+        if (user) {
+            const success = await removeFromImmune(user.id);
+            
+            if (success) {
+                const embed = new EmbedBuilder()
+                    .setColor(0xFF0000)
+                    .setTitle('❌ Immunity Removed')
+                    .setDescription(`${user.tag} is no longer immune to warnings.`)
+                    .addFields(
+                        { name: 'Removed By', value: interaction.user.tag, inline: true }
+                    )
+                    .setTimestamp();
+                    
+                await interaction.reply({ embeds: [embed] });
+                await logAction('IMMUNE_REMOVE', `${interaction.user.tag} removed immunity from ${user.tag}`, 0xFF0000, interaction.user);
+            } else {
+                await interaction.reply({ 
+                    content: '❌ Failed to remove immunity.', 
                     ephemeral: true 
                 });
             }
@@ -1268,6 +1380,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 return;
             }
             
+            // Check if user is immune
+            if (await isImmune(user.id)) {
+                const immuneEmbed = new EmbedBuilder()
+                    .setColor(0xFFFF00)
+                    .setTitle('🛡️ Immune User')
+                    .setDescription(`${user.tag} is immune to warnings and cannot be warned.`)
+                    .addFields(
+                        { name: 'User', value: `${user} (${user.tag})`, inline: true },
+                        { name: 'Moderator', value: `${interaction.user}`, inline: true },
+                        { name: 'Attempted Reason', value: reason, inline: false }
+                    )
+                    .setThumbnail(user.displayAvatarURL())
+                    .setFooter({ text: `User ID: ${user.id}` })
+                    .setTimestamp();
+                
+                await interaction.reply({ embeds: [immuneEmbed] });
+                await logAction('IMMUNE_BLOCK', `${interaction.user.tag} attempted to warn immune user ${user.tag}`, 0xFFFF00, interaction.user);
+                return;
+            }
+            
             // Check if user is whitelisted
             if (await isWhitelisted(user.id)) {
                 await interaction.reply({ 
@@ -1278,6 +1410,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
             }
             
             const { warnings, warningId } = await addWarning(user, interaction.guild, reason, interaction.member);
+            
+            if (warnings === -1) {
+                // This should not happen as we already checked for immunity, but just in case
+                const immuneEmbed = new EmbedBuilder()
+                    .setColor(0xFFFF00)
+                    .setTitle('🛡️ Immune User')
+                    .setDescription(`${user.tag} is immune to warnings and cannot be warned.`)
+                    .setThumbnail(user.displayAvatarURL())
+                    .setFooter({ text: `User ID: ${user.id}` })
+                    .setTimestamp();
+                
+                await interaction.reply({ embeds: [immuneEmbed] });
+                return;
+            }
             
             if (warnings > 0) {
                 // Create a beautiful warning embed
@@ -1512,6 +1658,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     
     if (commandName === 'security_status') {
         const whitelistedUsers = await Whitelist.countDocuments();
+        const immuneUsers = await Immune.countDocuments();
         const totalWarnings = await Warning.countDocuments();
         
         const statusEmbed = new EmbedBuilder()
@@ -1525,6 +1672,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 { name: 'Mass Mention Protection', value: data.enabledFeatures.massMentionProtection ? '✅ Enabled' : '❌ Disabled', inline: true },
                 { name: 'Invite Protection', value: data.enabledFeatures.inviteProtection ? '✅ Enabled' : '❌ Disabled', inline: true },
                 { name: 'Whitelisted Users', value: whitelistedUsers.toString(), inline: true },
+                { name: 'Immune Users', value: immuneUsers.toString(), inline: true },
                 { name: 'Total Warnings', value: totalWarnings.toString(), inline: true }
             )
             .setTimestamp();
@@ -1686,6 +1834,34 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.editReply({ embeds: [embed] });
         await logAction('ROLES_SETUP', `${interaction.user.tag} setup security roles`, 0x00FF00, interaction.user);
     }
+    
+    if (commandName === 'view_immune') {
+        const immuneUsers = await Immune.find();
+        
+        if (immuneUsers.length === 0) {
+            const embed = new EmbedBuilder()
+                .setColor(0x00FF00)
+                .setTitle('✅ No Immune Users')
+                .setDescription('There are currently no immune users.')
+                .setTimestamp();
+                
+            await interaction.reply({ embeds: [embed] });
+            return;
+        }
+        
+        const immuneList = immuneUsers.slice(0, 10).map((u, i) => 
+            `**${i+1}.** <@${u.userId}> - Added by <@${u.addedBy}> (<t:${Math.floor(u.timestamp.getTime() / 1000)}:R>)\n   Reason: ${u.reason}`
+        ).join('\n\n');
+        
+        const embed = new EmbedBuilder()
+            .setColor(0xFFFF00)
+            .setTitle('🛡️ Immune Users')
+            .setDescription(immuneList)
+            .setFooter({ text: `Showing ${Math.min(immuneUsers.length, 10)} of ${immuneUsers.length} immune users` })
+            .setTimestamp();
+            
+        await interaction.reply({ embeds: [embed] });
+    }
 });
 
 // Register slash commands for a specific guild
@@ -1755,6 +1931,40 @@ client.on(Events.ClientReady, async () => {
                     required: true
                 }
             ]
+        },
+        {
+            name: 'immune',
+            description: 'Make a user immune to warnings',
+            options: [
+                {
+                    name: 'user',
+                    type: 6,
+                    description: 'The user to make immune',
+                    required: true
+                },
+                {
+                    name: 'reason',
+                    type: 3,
+                    description: 'Reason for immunity',
+                    required: false
+                }
+            ]
+        },
+        {
+            name: 'unimmune',
+            description: 'Remove immunity from a user',
+            options: [
+                {
+                    name: 'user',
+                    type: 6,
+                    description: 'The user to remove immunity from',
+                    required: true
+                }
+            ]
+        },
+        {
+            name: 'view_immune',
+            description: 'View all immune users'
         },
         {
             name: 'warn',
@@ -1990,7 +2200,7 @@ process.on('unhandledRejection', (error) => {
 });
 
 // Auto-restart mechanism (for unexpected crashes)
-process.on('uncaughtException', (error) => {
+process.on('uncaughtException', (error) {
     console.error('❌ Uncaught exception:', error);
     process.exit(1);
 });
