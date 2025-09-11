@@ -18,7 +18,8 @@ const warningSchema = new mongoose.Schema({
   guildId: { type: String, required: true },
   reason: { type: String, required: true },
   timestamp: { type: Date, default: Date.now },
-  moderator: { type: String, required: true }
+  moderator: { type: String, required: true },
+  warningId: { type: String, required: true }
 });
 
 const whitelistSchema = new mongoose.Schema({
@@ -386,14 +387,22 @@ async function removeFromWhitelist(userId) {
     }
 }
 
+// Generate a unique warning ID
+function generateWarningId() {
+    return Math.random().toString(36).substring(2, 10).toUpperCase();
+}
+
 // Add warning to user
 async function addWarning(user, guild, reason, moderator) {
     try {
+        const warningId = generateWarningId();
+        
         await Warning.create({
             userId: user.id,
             guildId: guild.id,
             reason,
-            moderator: moderator.id
+            moderator: moderator.id,
+            warningId
         });
         
         const warnings = await Warning.countDocuments({ userId: user.id, guildId: guild.id });
@@ -401,14 +410,18 @@ async function addWarning(user, guild, reason, moderator) {
         // Send warning DM
         try {
             const warningEmbed = new EmbedBuilder()
-                .setColor(0xFF0000)
+                .setColor(0xFFA500)
                 .setTitle('⚠️ Warning Issued')
-                .setDescription(`You have received a warning in ${guild.name}`)
+                .setDescription(`You have received a warning in **${guild.name}**`)
                 .addFields(
+                    { name: 'Warning ID', value: `\`${warningId}\``, inline: true },
                     { name: 'Reason', value: reason, inline: true },
+                    { name: 'Moderator', value: moderator.user.tag, inline: true },
                     { name: 'Total Warnings', value: `${warnings}/3`, inline: true },
+                    { name: 'Date', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true },
                     { name: 'Next Action', value: warnings >= 3 ? 'Kick from server' : 'Warning', inline: true }
                 )
+                .setFooter({ text: 'Please follow the server rules to avoid further actions' })
                 .setTimestamp();
                 
             await user.send({ embeds: [warningEmbed] });
@@ -426,22 +439,41 @@ async function addWarning(user, guild, reason, moderator) {
                 
                 // Clear warnings after kick
                 await Warning.deleteMany({ userId: user.id, guildId: guild.id });
+                
+                // Send kick notification
+                try {
+                    const kickEmbed = new EmbedBuilder()
+                        .setColor(0xFF0000)
+                        .setTitle('🚫 Member Kicked')
+                        .setDescription(`You have been kicked from **${guild.name}** for accumulating 3 warnings`)
+                        .addFields(
+                            { name: 'Reason', value: 'Excessive warnings (3/3)', inline: true },
+                            { name: 'Action', value: 'Kick', inline: true },
+                            { name: 'Date', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
+                        )
+                        .setFooter({ text: 'You can rejoin the server if you believe this was a mistake' })
+                        .setTimestamp();
+                        
+                    await user.send({ embeds: [kickEmbed] });
+                } catch (dmError) {
+                    console.error('Could not send kick DM to user:', dmError);
+                }
             } catch (error) {
                 console.error('Failed to kick user:', error);
             }
         }
         
-        return warnings;
+        return { warnings, warningId };
     } catch (error) {
         console.error('Error adding warning:', error);
-        return 0;
+        return { warnings: 0, warningId: null };
     }
 }
 
 // Get user warnings
 async function getWarnings(userId, guildId) {
     try {
-        return await Warning.find({ userId, guildId });
+        return await Warning.find({ userId, guildId }).sort({ timestamp: -1 });
     } catch (error) {
         console.error('Error getting warnings:', error);
         return [];
@@ -455,6 +487,17 @@ async function clearWarnings(userId, guildId) {
         return true;
     } catch (error) {
         console.error('Error clearing warnings:', error);
+        return false;
+    }
+}
+
+// Remove specific warning by ID
+async function removeWarning(warningId, guildId) {
+    try {
+        const result = await Warning.deleteOne({ warningId, guildId });
+        return result.deletedCount > 0;
+    } catch (error) {
+        console.error('Error removing warning:', error);
         return false;
     }
 }
@@ -1202,6 +1245,89 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
     }
     
+    if (commandName === 'warn') {
+        const user = options.getUser('user');
+        const reason = options.getString('reason');
+        
+        if (user && reason) {
+            // Check if trying to warn self
+            if (user.id === interaction.user.id) {
+                await interaction.reply({ 
+                    content: '❌ You cannot warn yourself.', 
+                    ephemeral: true 
+                });
+                return;
+            }
+            
+            // Check if trying to warn a bot
+            if (user.bot) {
+                await interaction.reply({ 
+                    content: '❌ You cannot warn bots.', 
+                    ephemeral: true 
+                });
+                return;
+            }
+            
+            // Check if user is whitelisted
+            if (await isWhitelisted(user.id)) {
+                await interaction.reply({ 
+                    content: '❌ This user is whitelisted and cannot be warned.', 
+                    ephemeral: true 
+                });
+                return;
+            }
+            
+            const { warnings, warningId } = await addWarning(user, interaction.guild, reason, interaction.member);
+            
+            if (warnings > 0) {
+                // Create a beautiful warning embed
+                const warnEmbed = new EmbedBuilder()
+                    .setColor(0xFFA500)
+                    .setTitle('⚠️ Warning Issued')
+                    .setDescription(`A warning has been issued to ${user.tag}`)
+                    .addFields(
+                        { name: 'User', value: `${user} (${user.tag})`, inline: true },
+                        { name: 'Moderator', value: `${interaction.user}`, inline: true },
+                        { name: 'Warning ID', value: `\`${warningId}\``, inline: true },
+                        { name: 'Reason', value: reason, inline: false },
+                        { name: 'Total Warnings', value: `${warnings}/3`, inline: true },
+                        { name: 'Date', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true },
+                        { name: 'Next Action', value: warnings >= 3 ? 'Kick from server' : 'Warning', inline: true }
+                    )
+                    .setThumbnail(user.displayAvatarURL())
+                    .setFooter({ text: `User ID: ${user.id}` })
+                    .setTimestamp();
+                
+                await interaction.reply({ embeds: [warnEmbed] });
+                await logAction('WARNING_ISSUED', `${interaction.user.tag} warned ${user.tag} for: ${reason} (Total: ${warnings}/3)`, 0xFFA500, interaction.user);
+                
+                // If user reached 3 warnings and was kicked
+                if (warnings >= 3) {
+                    const kickEmbed = new EmbedBuilder()
+                        .setColor(0xFF0000)
+                        .setTitle('🚫 Member Kicked')
+                        .setDescription(`${user.tag} has been kicked for accumulating 3 warnings`)
+                        .addFields(
+                            { name: 'User', value: `${user} (${user.tag})`, inline: true },
+                            { name: 'Moderator', value: `${interaction.user}`, inline: true },
+                            { name: 'Reason', value: 'Excessive warnings (3/3)', inline: true },
+                            { name: 'Date', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
+                        )
+                        .setThumbnail(user.displayAvatarURL())
+                        .setFooter({ text: `User ID: ${user.id}` })
+                        .setTimestamp();
+                    
+                    await interaction.followUp({ embeds: [kickEmbed] });
+                }
+            } else {
+                await interaction.reply({ 
+                    content: '❌ Failed to issue warning.', 
+                    ephemeral: true 
+                });
+            }
+        }
+    }
+    
     if (commandName === 'enable') {
         const feature = options.getString('feature');
         if (feature === 'link-blocking') {
@@ -1415,7 +1541,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 const embed = new EmbedBuilder()
                     .setColor(0x00FF00)
                     .setTitle('✅ Warnings Cleared')
-                    .setDescription(`Cleared warnings for ${user.tag}`)
+                    .setDescription(`Cleared all warnings for ${user.tag}`)
+                    .addFields(
+                        { name: 'User', value: `${user} (${user.tag})`, inline: true },
+                        { name: 'Moderator', value: `${interaction.user}`, inline: true },
+                        { name: 'Date', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
+                    )
+                    .setThumbnail(user.displayAvatarURL())
+                    .setFooter({ text: `User ID: ${user.id}` })
                     .setTimestamp();
                     
                 await interaction.reply({ embeds: [embed] });
@@ -1423,6 +1556,71 @@ client.on(Events.InteractionCreate, async (interaction) => {
             } else {
                 await interaction.reply({ 
                     content: '❌ Failed to clear warnings.', 
+                    ephemeral: true 
+                });
+            }
+        }
+    }
+    
+    if (commandName === 'view_warnings') {
+        const user = options.getUser('user') || interaction.user;
+        
+        const warnings = await getWarnings(user.id, interaction.guild.id);
+        
+        if (warnings.length === 0) {
+            const embed = new EmbedBuilder()
+                .setColor(0x00FF00)
+                .setTitle('✅ No Warnings')
+                .setDescription(`${user.tag} has no warnings.`)
+                .setThumbnail(user.displayAvatarURL())
+                .setFooter({ text: `User ID: ${user.id}` })
+                .setTimestamp();
+                
+            await interaction.reply({ embeds: [embed] });
+            return;
+        }
+        
+        const warningList = warnings.slice(0, 10).map((w, i) => 
+            `**${i+1}.** ${w.reason} - <t:${Math.floor(w.timestamp.getTime() / 1000)}:R> (ID: \`${w.warningId}\`)`
+        ).join('\n');
+        
+        const embed = new EmbedBuilder()
+            .setColor(0xFFA500)
+            .setTitle(`⚠️ Warnings for ${user.tag}`)
+            .setDescription(warningList)
+            .addFields(
+                { name: 'Total Warnings', value: warnings.length.toString(), inline: true },
+                { name: 'Next Action', value: warnings.length >= 3 ? 'Kick from server' : 'Warning', inline: true }
+            )
+            .setThumbnail(user.displayAvatarURL())
+            .setFooter({ text: `User ID: ${user.id} | Showing ${Math.min(warnings.length, 10)} of ${warnings.length} warnings` })
+            .setTimestamp();
+            
+        await interaction.reply({ embeds: [embed] });
+    }
+    
+    if (commandName === 'remove_warning') {
+        const warningId = options.getString('warning_id');
+        
+        if (warningId) {
+            const success = await removeWarning(warningId, interaction.guild.id);
+            
+            if (success) {
+                const embed = new EmbedBuilder()
+                    .setColor(0x00FF00)
+                    .setTitle('✅ Warning Removed')
+                    .setDescription(`Successfully removed warning with ID: \`${warningId}\``)
+                    .addFields(
+                        { name: 'Moderator', value: `${interaction.user}`, inline: true },
+                        { name: 'Date', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
+                    )
+                    .setTimestamp();
+                    
+                await interaction.reply({ embeds: [embed] });
+                await logAction('WARNING_REMOVED', `${interaction.user.tag} removed warning with ID: ${warningId}`, 0x00FF00, interaction.user);
+            } else {
+                await interaction.reply({ 
+                    content: '❌ Failed to remove warning. Make sure the warning ID is correct.', 
                     ephemeral: true 
                 });
             }
@@ -1487,30 +1685,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
             
         await interaction.editReply({ embeds: [embed] });
         await logAction('ROLES_SETUP', `${interaction.user.tag} setup security roles`, 0x00FF00, interaction.user);
-    }
-    
-    if (commandName === 'view_warnings') {
-        const user = options.getUser('user') || interaction.user;
-        
-        const warnings = await getWarnings(user.id, interaction.guild.id);
-        
-        if (warnings.length === 0) {
-            await interaction.reply(`${user.tag} has no warnings.`);
-            return;
-        }
-        
-        const warningList = warnings.map((w, i) => 
-            `**${i+1}.** ${w.reason} - <t:${Math.floor(w.timestamp.getTime() / 1000)}:R>`
-        ).join('\n');
-        
-        const embed = new EmbedBuilder()
-            .setColor(0xFFA500)
-            .setTitle(`⚠️ Warnings for ${user.tag}`)
-            .setDescription(warningList)
-            .setFooter({ text: `Total: ${warnings.length} warnings` })
-            .setTimestamp();
-            
-        await interaction.reply({ embeds: [embed] });
     }
 });
 
@@ -1578,6 +1752,24 @@ client.on(Events.ClientReady, async () => {
                     name: 'user',
                     type: 6,
                     description: 'The user to unwhitelist',
+                    required: true
+                }
+            ]
+        },
+        {
+            name: 'warn',
+            description: 'Warn a user for rule violations',
+            options: [
+                {
+                    name: 'user',
+                    type: 6,
+                    description: 'The user to warn',
+                    required: true
+                },
+                {
+                    name: 'reason',
+                    type: 3,
+                    description: 'Reason for the warning',
                     required: true
                 }
             ]
@@ -1687,6 +1879,18 @@ client.on(Events.ClientReady, async () => {
                     type: 6,
                     description: 'The user to view warnings for',
                     required: false
+                }
+            ]
+        },
+        {
+            name: 'remove_warning',
+            description: 'Remove a specific warning by ID',
+            options: [
+                {
+                    name: 'warning_id',
+                    type: 3,
+                    description: 'The ID of the warning to remove',
+                    required: true
                 }
             ]
         },
