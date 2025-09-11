@@ -3,6 +3,49 @@ const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
+const mongoose = require('mongoose');
+
+// MongoDB Connection
+const MONGODB_URI = 'mongodb+srv://yuvraj:yuvr2012@orbitx.x17pmve.mongodb.net/discordbot?retryWrites=true&w=majority&appName=orbitx';
+
+mongoose.connect(MONGODB_URI)
+  .then(() => console.log('✅ Connected to MongoDB'))
+  .catch(err => console.error('❌ MongoDB connection error:', err));
+
+// MongoDB Schemas
+const warningSchema = new mongoose.Schema({
+  userId: { type: String, required: true },
+  guildId: { type: String, required: true },
+  reason: { type: String, required: true },
+  timestamp: { type: Date, default: Date.now },
+  moderator: { type: String, required: true }
+});
+
+const whitelistSchema = new mongoose.Schema({
+  userId: { type: String, required: true, unique: true },
+  addedBy: { type: String, required: true },
+  timestamp: { type: Date, default: Date.now }
+});
+
+const ticketSchema = new mongoose.Schema({
+  channelId: { type: String, required: true, unique: true },
+  creator: { type: String, required: true },
+  type: { type: String, required: true },
+  claimedBy: { type: String, default: null },
+  locked: { type: Boolean, default: false },
+  closed: { type: Boolean, default: false },
+  createdAt: { type: Date, default: Date.now },
+  closedAt: { type: Date, default: null },
+  messages: { type: Array, default: [] }
+});
+
+// Add TTL indexes for auto-cleanup
+warningSchema.index({ timestamp: 1 }, { expireAfterSeconds: 7776000 }); // 90 days
+ticketSchema.index({ closedAt: 1 }, { expireAfterSeconds: 2592000 }); // 30 days
+
+const Warning = mongoose.model('Warning', warningSchema);
+const Whitelist = mongoose.model('Whitelist', whitelistSchema);
+const Ticket = mongoose.model('Ticket', ticketSchema);
 
 // Keep-alive server for Render
 const keepAlive = express();
@@ -35,81 +78,58 @@ const config = {
     logChannelId: process.env.LOG_CHANNEL_ID,
     botToken: process.env.BOT_TOKEN,
     guildId: process.env.GUILD_ID,
-    adminIds: ['1212047208673837087', '1202998273376522331'], // Admin user IDs
-    ticketViewerRoleId: '1414824820901679155', // Role that can view and manage tickets
-    mentionRoleName: 'Mention Permissions', // Role that allows mentioning @everyone and roles
-    securityRoleName: 'Security Admin' // Role for security permissions
+    adminIds: process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(',') : [],
+    ticketViewerRoleId: process.env.TICKET_VIEWER_ROLE_ID,
+    mentionRoleName: process.env.MENTION_ROLE_NAME || 'Mention Permissions',
+    securityRoleName: process.env.SECURITY_ROLE_NAME || 'Security Admin',
+    authorizedUsers: process.env.AUTHORIZED_USERS ? process.env.AUTHORIZED_USERS.split(',') : []
 };
 
-// Data storage
-const data = {
-    whitelistedUsers: new Set(),
-    enabledFeatures: {
-        linkBlocking: true,
-        securityMode: true,
-        antiSpam: true,
-        antiRaid: true,
-        antiNuke: true,
-        massMentionProtection: true,
-        inviteProtection: true
-    },
-    tickets: new Map(),
+// Memory storage for temporary data
+const memoryData = {
     recentDeletions: new Map(),
     deletedChannels: new Map(),
-    warnedUsers: new Map(),
     userMessageCount: new Map(),
     userJoinTimestamps: new Map(),
     userInviteCount: new Map()
 };
 
-// Load data from file if exists
-function loadData() {
+// Load data from MongoDB
+async function loadData() {
     try {
-        if (fs.existsSync('./data.json')) {
-            const savedData = JSON.parse(fs.readFileSync('./data.json', 'utf8'));
-            data.whitelistedUsers = new Set(savedData.whitelistedUsers || []);
-            data.enabledFeatures = savedData.enabledFeatures || { 
-                linkBlocking: true, 
+        // Load enabled features from environment variables with defaults
+        const enabledFeatures = {
+            linkBlocking: process.env.LINK_BLOCKING !== 'false',
+            securityMode: process.env.SECURITY_MODE !== 'false',
+            antiSpam: process.env.ANTI_SPAM !== 'false',
+            antiRaid: process.env.ANTI_RAID !== 'false',
+            antiNuke: process.env.ANTI_NUKE !== 'false',
+            massMentionProtection: process.env.MASS_MENTION_PROTECTION !== 'false',
+            inviteProtection: process.env.INVITE_PROTECTION !== 'false'
+        };
+        
+        return { enabledFeatures };
+    } catch (error) {
+        console.error('Error loading data:', error);
+        return {
+            enabledFeatures: {
+                linkBlocking: true,
                 securityMode: true,
                 antiSpam: true,
                 antiRaid: true,
                 antiNuke: true,
                 massMentionProtection: true,
                 inviteProtection: true
-            };
-            if (savedData.warnedUsers) {
-                for (const [userId, warnings] of Object.entries(savedData.warnedUsers)) {
-                    data.warnedUsers.set(userId, warnings);
-                }
             }
-        }
-    } catch (error) {
-        console.error('Error loading data:', error);
-    }
-}
-
-// Save data to file
-function saveData() {
-    try {
-        const warnedUsersObj = {};
-        for (const [userId, warnings] of data.warnedUsers) {
-            warnedUsersObj[userId] = warnings;
-        }
-        
-        const saveData = {
-            whitelistedUsers: Array.from(data.whitelistedUsers),
-            enabledFeatures: data.enabledFeatures,
-            warnedUsers: warnedUsersObj
         };
-        
-        fs.writeFileSync('./data.json', JSON.stringify(saveData, null, 2));
-    } catch (error) {
-        console.error('Error saving data:', error);
     }
 }
 
-// Initialize
-loadData();
+// Get enabled features
+let data = {};
+loadData().then(loadedData => {
+    data = loadedData;
+});
 
 // Logging function
 async function logAction(action, details, color = 0x0099FF, user = null) {
@@ -251,12 +271,12 @@ client.on(Events.GuildMemberAdd, async (member) => {
         // Anti-raid protection
         if (data.enabledFeatures.antiRaid) {
             const now = Date.now();
-            const joinTimestamps = data.userJoinTimestamps.get(member.guild.id) || [];
+            const joinTimestamps = memoryData.userJoinTimestamps.get(member.guild.id) || [];
             
             // Keep only joins from the last 10 seconds
             const recentJoins = joinTimestamps.filter(time => now - time < 10000);
             recentJoins.push(now);
-            data.userJoinTimestamps.set(member.guild.id, recentJoins);
+            memoryData.userJoinTimestamps.set(member.guild.id, recentJoins);
             
             // If more than 5 joins in 10 seconds, activate lockdown
             if (recentJoins.length >= 5) {
@@ -334,6 +354,111 @@ async function disableLockdown(guild) {
     }
 }
 
+// Check if user is whitelisted
+async function isWhitelisted(userId) {
+    try {
+        return await Whitelist.exists({ userId });
+    } catch (error) {
+        console.error('Error checking whitelist:', error);
+        return false;
+    }
+}
+
+// Add user to whitelist
+async function addToWhitelist(userId, addedBy) {
+    try {
+        await Whitelist.create({ userId, addedBy });
+        return true;
+    } catch (error) {
+        console.error('Error adding to whitelist:', error);
+        return false;
+    }
+}
+
+// Remove user from whitelist
+async function removeFromWhitelist(userId) {
+    try {
+        await Whitelist.deleteOne({ userId });
+        return true;
+    } catch (error) {
+        console.error('Error removing from whitelist:', error);
+        return false;
+    }
+}
+
+// Add warning to user
+async function addWarning(user, guild, reason, moderator) {
+    try {
+        await Warning.create({
+            userId: user.id,
+            guildId: guild.id,
+            reason,
+            moderator: moderator.id
+        });
+        
+        const warnings = await Warning.countDocuments({ userId: user.id, guildId: guild.id });
+        
+        // Send warning DM
+        try {
+            const warningEmbed = new EmbedBuilder()
+                .setColor(0xFF0000)
+                .setTitle('⚠️ Warning Issued')
+                .setDescription(`You have received a warning in ${guild.name}`)
+                .addFields(
+                    { name: 'Reason', value: reason, inline: true },
+                    { name: 'Total Warnings', value: `${warnings}/3`, inline: true },
+                    { name: 'Next Action', value: warnings >= 3 ? 'Kick from server' : 'Warning', inline: true }
+                )
+                .setTimestamp();
+                
+            await user.send({ embeds: [warningEmbed] });
+        } catch (error) {
+            console.error('Could not send DM to user:', error);
+        }
+        
+        // Check if user has reached 3 warnings
+        if (warnings >= 3) {
+            try {
+                const member = await guild.members.fetch(user.id);
+                await member.kick('Received 3 warnings');
+                
+                await logAction('MEMBER_KICKED', `Kicked ${user.tag} for receiving 3 warnings`, 0xFF0000, user);
+                
+                // Clear warnings after kick
+                await Warning.deleteMany({ userId: user.id, guildId: guild.id });
+            } catch (error) {
+                console.error('Failed to kick user:', error);
+            }
+        }
+        
+        return warnings;
+    } catch (error) {
+        console.error('Error adding warning:', error);
+        return 0;
+    }
+}
+
+// Get user warnings
+async function getWarnings(userId, guildId) {
+    try {
+        return await Warning.find({ userId, guildId });
+    } catch (error) {
+        console.error('Error getting warnings:', error);
+        return [];
+    }
+}
+
+// Clear user warnings
+async function clearWarnings(userId, guildId) {
+    try {
+        await Warning.deleteMany({ userId, guildId });
+        return true;
+    } catch (error) {
+        console.error('Error clearing warnings:', error);
+        return false;
+    }
+}
+
 // Ticket System
 client.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.isButton()) return;
@@ -342,15 +467,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.customId === 'general_support' || interaction.customId === 'team_apply' || interaction.customId === 'ally_merge') {
         try {
             // Check if user already has an open ticket
-            let hasOpenTicket = false;
-            for (const [channelId, ticket] of data.tickets) {
-                if (ticket.creator === interaction.user.id && !ticket.closed) {
-                    hasOpenTicket = true;
-                    break;
-                }
-            }
+            const openTicket = await Ticket.findOne({ 
+                creator: interaction.user.id, 
+                closed: false 
+            });
             
-            if (hasOpenTicket) {
+            if (openTicket) {
                 await interaction.reply({ 
                     content: 'You already have an open ticket! Please close it before creating a new one.', 
                     ephemeral: true 
@@ -422,15 +544,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 permissionOverwrites: permissionOverwrites
             });
             
-            // Store ticket info
-            data.tickets.set(ticketChannel.id, {
+            // Store ticket info in MongoDB
+            await Ticket.create({
+                channelId: ticketChannel.id,
                 creator: interaction.user.id,
                 type: ticketType,
-                createdAt: new Date(),
-                claimedBy: null,
-                locked: false,
-                closed: false,
-                messages: []
+                createdAt: new Date()
             });
             
             const claimButton = new ButtonBuilder()
@@ -489,7 +608,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     
     // Ticket management buttons
     if (interaction.customId === 'claim_ticket' || interaction.customId === 'lock_ticket' || interaction.customId === 'unlock_ticket' || interaction.customId === 'delete_ticket') {
-        const ticketData = data.tickets.get(interaction.channel.id);
+        const ticketData = await Ticket.findOne({ channelId: interaction.channel.id });
         if (!ticketData) {
             await interaction.reply({ 
                 content: '❌ This is not a valid ticket channel.', 
@@ -516,8 +635,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 return;
             }
             
-            ticketData.claimedBy = interaction.user.id;
-            data.tickets.set(interaction.channel.id, ticketData);
+            await Ticket.updateOne(
+                { channelId: interaction.channel.id },
+                { claimedBy: interaction.user.id }
+            );
             
             await interaction.channel.permissionOverwrites.edit(interaction.user.id, {
                 ViewChannel: true,
@@ -542,8 +663,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 return;
             }
             
-            ticketData.locked = true;
-            data.tickets.set(interaction.channel.id, ticketData);
+            await Ticket.updateOne(
+                { channelId: interaction.channel.id },
+                { locked: true }
+            );
             
             await interaction.channel.permissionOverwrites.edit(ticketData.creator, {
                 ViewChannel: true,
@@ -602,8 +725,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 return;
             }
             
-            ticketData.locked = false;
-            data.tickets.set(interaction.channel.id, ticketData);
+            await Ticket.updateOne(
+                { channelId: interaction.channel.id },
+                { locked: false }
+            );
             
             await interaction.channel.permissionOverwrites.edit(ticketData.creator, {
                 ViewChannel: true,
@@ -655,8 +780,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
         
         if (interaction.customId === 'delete_ticket') {
             // Mark ticket as closed before deletion
-            ticketData.closed = true;
-            data.tickets.set(interaction.channel.id, ticketData);
+            await Ticket.updateOne(
+                { channelId: interaction.channel.id },
+                { 
+                    closed: true,
+                    closedAt: new Date()
+                }
+            );
             
             // Acknowledge the interaction immediately
             await interaction.deferReply();
@@ -730,7 +860,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
             }
             
             await interaction.channel.delete();
-            data.tickets.delete(interaction.channel.id);
             await logAction('TICKET_DELETE', `${interaction.user.tag} deleted ticket ${interaction.channel.name}`, 0xFF0000, interaction.user);
         }
     }
@@ -752,16 +881,16 @@ client.on(Events.ChannelDelete, async (channel) => {
             const executor = entry.executor;
             
             // Skip if bot or whitelisted user
-            if (executor.bot || data.whitelistedUsers.has(executor.id)) return;
+            if (executor.bot || await isWhitelisted(executor.id)) return;
             
             // Track deletion attempts
             const now = Date.now();
-            const userDeletions = data.recentDeletions.get(executor.id) || [];
+            const userDeletions = memoryData.recentDeletions.get(executor.id) || [];
             userDeletions.push(now);
-            data.recentDeletions.set(executor.id, userDeletions.filter(time => now - time < 5000));
+            memoryData.recentDeletions.set(executor.id, userDeletions.filter(time => now - time < 5000));
             
             // Check if user has made multiple deletions in short time
-            const recentCount = data.recentDeletions.get(executor.id).length;
+            const recentCount = memoryData.recentDeletions.get(executor.id).length;
             
             if (recentCount >= 2) {
                 // Ban user for excessive deletions
@@ -814,7 +943,7 @@ client.on(Events.ChannelCreate, async (channel) => {
         
         const entry = auditLogs.entries.first();
         
-        if (entry && entry.executor && !data.whitelistedUsers.has(entry.executor.id) && !entry.executor.bot) {
+        if (entry && entry.executor && !await isWhitelisted(entry.executor.id) && !entry.executor.bot) {
             await channel.delete();
             await logAction('CHANNEL_CREATE_BLOCKED', `Prevented channel creation by non-whitelisted user: ${entry.executor.tag}`, 0xFF0000, entry.executor);
         }
@@ -834,7 +963,7 @@ client.on(Events.RoleCreate, async (role) => {
         
         const entry = auditLogs.entries.first();
         
-        if (entry && entry.executor && !data.whitelistedUsers.has(entry.executor.id) && !entry.executor.bot) {
+        if (entry && entry.executor && !await isWhitelisted(entry.executor.id) && !entry.executor.bot) {
             await role.delete();
             await logAction('ROLE_CREATE_BLOCKED', `Prevented role creation by non-whitelisted user: ${entry.executor.tag}`, 0xFF0000, entry.executor);
         }
@@ -854,7 +983,7 @@ client.on(Events.RoleDelete, async (role) => {
         
         const entry = auditLogs.entries.first();
         
-        if (entry && entry.executor && !data.whitelistedUsers.has(entry.executor.id) && !entry.executor.bot) {
+        if (entry && entry.executor && !await isWhitelisted(entry.executor.id) && !entry.executor.bot) {
             await logAction('ROLE_DELETE_BLOCKED', `Prevented role deletion by non-whitelisted user: ${entry.executor.tag}`, 0xFF0000, entry.executor);
         }
     } catch (error) {
@@ -872,12 +1001,12 @@ client.on(Events.MessageCreate, async (message) => {
         const now = Date.now();
         
         // Get user's message count
-        let userMessages = data.userMessageCount.get(userId) || [];
+        let userMessages = memoryData.userMessageCount.get(userId) || [];
         
         // Filter messages from the last 5 seconds
         userMessages = userMessages.filter(time => now - time < 5000);
         userMessages.push(now);
-        data.userMessageCount.set(userId, userMessages);
+        memoryData.userMessageCount.set(userId, userMessages);
         
         // If user sent more than 5 messages in 5 seconds, mute them
         if (userMessages.length > 5) {
@@ -891,7 +1020,7 @@ client.on(Events.MessageCreate, async (message) => {
                 await logAction('ANTI_SPAM', `Muted ${message.author.tag} for spamming (${userMessages.length} messages in 5 seconds)`, 0xFF0000, message.author);
                 
                 // Reset message count
-                data.userMessageCount.delete(userId);
+                memoryData.userMessageCount.delete(userId);
             } catch (error) {
                 console.error('Error muting user for spam:', error);
             }
@@ -901,7 +1030,7 @@ client.on(Events.MessageCreate, async (message) => {
     // Link blocking
     if (data.enabledFeatures.linkBlocking) {
         const urlRegex = /https?:\/\/[^\s]+/g;
-        if (urlRegex.test(message.content) && !data.whitelistedUsers.has(message.author.id)) {
+        if (urlRegex.test(message.content) && !await isWhitelisted(message.author.id)) {
             await message.delete();
             
             const warningEmbed = new EmbedBuilder()
@@ -925,14 +1054,14 @@ client.on(Events.MessageCreate, async (message) => {
             await logAction('LINK_BLOCK', `Blocked link from ${message.author.tag}: ${message.content}`, 0xFF0000, message.author);
             
             // Add warning for link violation
-            addWarning(message.author, message.guild, 'Link violation');
+            await addWarning(message.author, message.guild, 'Link violation', message.member);
         }
     }
     
     // Invite link protection
     if (data.enabledFeatures.inviteProtection) {
         const inviteRegex = /(discord\.gg|discordapp\.com\/invite|discord\.com\/invite)\/[a-zA-Z0-9]+/g;
-        if (inviteRegex.test(message.content) && !data.whitelistedUsers.has(message.author.id)) {
+        if (inviteRegex.test(message.content) && !await isWhitelisted(message.author.id)) {
             await message.delete();
             
             const warningEmbed = new EmbedBuilder()
@@ -956,7 +1085,7 @@ client.on(Events.MessageCreate, async (message) => {
             await logAction('INVITE_BLOCK', `Blocked invite from ${message.author.tag}: ${message.content}`, 0xFF0000, message.author);
             
             // Add warning for invite violation
-            addWarning(message.author, message.guild, 'Discord invite violation');
+            await addWarning(message.author, message.guild, 'Discord invite violation', message.member);
         }
     }
     
@@ -965,7 +1094,7 @@ client.on(Events.MessageCreate, async (message) => {
         const mentionCount = (message.mentions.users.size + message.mentions.roles.size);
         const hasEveryone = message.mentions.everyone || message.mentions.here;
         
-        if ((hasEveryone || mentionCount > 3) && !data.whitelistedUsers.has(message.author.id)) {
+        if ((hasEveryone || mentionCount > 3) && !await isWhitelisted(message.author.id)) {
             // Check if user has permission to mention everyone
             if (message.member.permissions.has(PermissionsBitField.Flags.MentionEveryone)) return;
             
@@ -990,56 +1119,12 @@ client.on(Events.MessageCreate, async (message) => {
             }
             
             // Add warning for mass mention
-            addWarning(message.author, message.guild, 'Mass mention violation');
+            await addWarning(message.author, message.guild, 'Mass mention violation', message.member);
             
             await logAction('MASS_MENTION_WARNING', `Warned ${message.author.tag} for mass mentioning`, 0xFFA500, message.author);
         }
     }
 });
-
-// Warning system functions
-async function addWarning(user, guild, reason) {
-    const userId = user.id;
-    const currentWarnings = data.warnedUsers.get(userId) || 0;
-    const newWarnings = currentWarnings + 1;
-    
-    data.warnedUsers.set(userId, newWarnings);
-    saveData();
-    
-    // Send warning DM
-    try {
-        const warningEmbed = new EmbedBuilder()
-            .setColor(0xFF0000)
-            .setTitle('⚠️ Warning Issued')
-            .setDescription(`You have received a warning in ${guild.name}`)
-            .addFields(
-                { name: 'Reason', value: reason, inline: true },
-                { name: 'Total Warnings', value: `${newWarnings}/3`, inline: true },
-                { name: 'Next Action', value: newWarnings >= 3 ? 'Kick from server' : 'Warning', inline: true }
-            )
-            .setTimestamp();
-            
-        await user.send({ embeds: [warningEmbed] });
-    } catch (error) {
-        console.error('Could not send DM to user:', error);
-    }
-    
-    // Check if user has reached 3 warnings
-    if (newWarnings >= 3) {
-        try {
-            const member = await guild.members.fetch(userId);
-            await member.kick('Received 3 warnings');
-            
-            await logAction('MEMBER_KICKED', `Kicked ${user.tag} for receiving 3 warnings`, 0xFF0000, user);
-            
-            // Reset warnings after kick
-            data.warnedUsers.delete(userId);
-            saveData();
-        } catch (error) {
-            console.error('Failed to kick user:', error);
-        }
-    }
-}
 
 // Slash Commands
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -1050,8 +1135,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     // Special handling for whitelist command - only allow specific users
     if (commandName === 'whitelist') {
         // Check if user is one of the authorized users
-        const authorizedUsers = ['1202998273376522331', '1306189174931718164'];
-        if (!authorizedUsers.includes(interaction.user.id)) {
+        if (!config.authorizedUsers.includes(interaction.user.id)) {
             await interaction.reply({ 
                 content: '❌ You are not authorized to use this command.', 
                 ephemeral: true 
@@ -1063,17 +1147,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
         // Proceed with the command if authorized
         const user = options.getUser('user');
         if (user) {
-            data.whitelistedUsers.add(user.id);
-            saveData();
+            const success = await addToWhitelist(user.id, interaction.user.id);
             
-            const embed = new EmbedBuilder()
-                .setColor(0x00FF00)
-                .setTitle('✅ User Whitelisted')
-                .setDescription(`${user.tag} has been added to the whitelist.`)
-                .setTimestamp();
-                
-            await interaction.reply({ embeds: [embed] });
-            await logAction('WHITELIST_ADD', `${interaction.user.tag} whitelisted ${user.tag}`, 0x00FF00, interaction.user);
+            if (success) {
+                const embed = new EmbedBuilder()
+                    .setColor(0x00FF00)
+                    .setTitle('✅ User Whitelisted')
+                    .setDescription(`${user.tag} has been added to the whitelist.`)
+                    .setTimestamp();
+                    
+                await interaction.reply({ embeds: [embed] });
+                await logAction('WHITELIST_ADD', `${interaction.user.tag} whitelisted ${user.tag}`, 0x00FF00, interaction.user);
+            } else {
+                await interaction.reply({ 
+                    content: '❌ Failed to whitelist user.', 
+                    ephemeral: true 
+                });
+            }
         }
     }
     
@@ -1092,17 +1182,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (commandName === 'unwhitelist') {
         const user = options.getUser('user');
         if (user) {
-            data.whitelistedUsers.delete(user.id);
-            saveData();
+            const success = await removeFromWhitelist(user.id);
             
-            const embed = new EmbedBuilder()
-                .setColor(0xFF0000)
-                .setTitle('❌ User Unwhitelisted')
-                .setDescription(`${user.tag} has been removed from the whitelist.`)
-                .setTimestamp();
-                
-            await interaction.reply({ embeds: [embed] });
-            await logAction('WHITELIST_REMOVE', `${interaction.user.tag} unwhitelisted ${user.tag}`, 0xFF0000, interaction.user);
+            if (success) {
+                const embed = new EmbedBuilder()
+                    .setColor(0xFF0000)
+                    .setTitle('❌ User Unwhitelisted')
+                    .setDescription(`${user.tag} has been removed from the whitelist.`)
+                    .setTimestamp();
+                    
+                await interaction.reply({ embeds: [embed] });
+                await logAction('WHITELIST_REMOVE', `${interaction.user.tag} unwhitelisted ${user.tag}`, 0xFF0000, interaction.user);
+            } else {
+                await interaction.reply({ 
+                    content: '❌ Failed to unwhitelist user.', 
+                    ephemeral: true 
+                });
+            }
         }
     }
     
@@ -1110,7 +1206,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const feature = options.getString('feature');
         if (feature === 'link-blocking') {
             data.enabledFeatures.linkBlocking = true;
-            saveData();
             
             const embed = new EmbedBuilder()
                 .setColor(0x00FF00)
@@ -1122,7 +1217,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
             await logAction('FEATURE_ENABLE', `${interaction.user.tag} enabled link-blocking`, 0x00FF00, interaction.user);
         } else if (feature === 'security-mode') {
             data.enabledFeatures.securityMode = true;
-            saveData();
             
             const embed = new EmbedBuilder()
                 .setColor(0x00FF00)
@@ -1134,7 +1228,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
             await logAction('FEATURE_ENABLE', `${interaction.user.tag} enabled security-mode`, 0x00FF00, interaction.user);
         } else if (feature === 'anti-spam') {
             data.enabledFeatures.antiSpam = true;
-            saveData();
             
             const embed = new EmbedBuilder()
                 .setColor(0x00FF00)
@@ -1146,7 +1239,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
             await logAction('FEATURE_ENABLE', `${interaction.user.tag} enabled anti-spam`, 0x00FF00, interaction.user);
         } else if (feature === 'anti-raid') {
             data.enabledFeatures.antiRaid = true;
-            saveData();
             
             const embed = new EmbedBuilder()
                 .setColor(0x00FF00)
@@ -1158,7 +1250,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
             await logAction('FEATURE_ENABLE', `${interaction.user.tag} enabled anti-raid`, 0x00FF00, interaction.user);
         } else if (feature === 'mass-mention-protection') {
             data.enabledFeatures.massMentionProtection = true;
-            saveData();
             
             const embed = new EmbedBuilder()
                 .setColor(0x00FF00)
@@ -1170,7 +1261,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
             await logAction('FEATURE_ENABLE', `${interaction.user.tag} enabled mass-mention-protection`, 0x00FF00, interaction.user);
         } else if (feature === 'invite-protection') {
             data.enabledFeatures.inviteProtection = true;
-            saveData();
             
             const embed = new EmbedBuilder()
                 .setColor(0x00FF00)
@@ -1187,7 +1277,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const feature = options.getString('feature');
         if (feature === 'link-blocking') {
             data.enabledFeatures.linkBlocking = false;
-            saveData();
             
             const embed = new EmbedBuilder()
                 .setColor(0xFF0000)
@@ -1199,7 +1288,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
             await logAction('FEATURE_DISABLE', `${interaction.user.tag} disabled link-blocking`, 0xFF0000, interaction.user);
         } else if (feature === 'security-mode') {
             data.enabledFeatures.securityMode = false;
-            saveData();
             
             const embed = new EmbedBuilder()
                 .setColor(0xFF0000)
@@ -1211,7 +1299,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
             await logAction('FEATURE_DISABLE', `${interaction.user.tag} disabled security-mode`, 0xFF0000, interaction.user);
         } else if (feature === 'anti-spam') {
             data.enabledFeatures.antiSpam = false;
-            saveData();
             
             const embed = new EmbedBuilder()
                 .setColor(0xFF0000)
@@ -1223,7 +1310,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
             await logAction('FEATURE_DISABLE', `${interaction.user.tag} disabled anti-spam`, 0xFF0000, interaction.user);
         } else if (feature === 'anti-raid') {
             data.enabledFeatures.antiRaid = false;
-            saveData();
             
             const embed = new EmbedBuilder()
                 .setColor(0xFF0000)
@@ -1235,7 +1321,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
             await logAction('FEATURE_DISABLE', `${interaction.user.tag} disabled anti-raid`, 0xFF0000, interaction.user);
         } else if (feature === 'mass-mention-protection') {
             data.enabledFeatures.massMentionProtection = false;
-            saveData();
             
             const embed = new EmbedBuilder()
                 .setColor(0xFF0000)
@@ -1247,7 +1332,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
             await logAction('FEATURE_DISABLE', `${interaction.user.tag} disabled mass-mention-protection`, 0xFF0000, interaction.user);
         } else if (feature === 'invite-protection') {
             data.enabledFeatures.inviteProtection = false;
-            saveData();
             
             const embed = new EmbedBuilder()
                 .setColor(0xFF0000)
@@ -1301,6 +1385,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     
     if (commandName === 'security_status') {
+        const whitelistedUsers = await Whitelist.countDocuments();
+        const totalWarnings = await Warning.countDocuments();
+        
         const statusEmbed = new EmbedBuilder()
             .setColor(0x0099FF)
             .setTitle('🛡️ Security Status')
@@ -1311,8 +1398,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 { name: 'Anti-Raid', value: data.enabledFeatures.antiRaid ? '✅ Enabled' : '❌ Disabled', inline: true },
                 { name: 'Mass Mention Protection', value: data.enabledFeatures.massMentionProtection ? '✅ Enabled' : '❌ Disabled', inline: true },
                 { name: 'Invite Protection', value: data.enabledFeatures.inviteProtection ? '✅ Enabled' : '❌ Disabled', inline: true },
-                { name: 'Whitelisted Users', value: data.whitelistedUsers.size.toString(), inline: true },
-                { name: 'Active Warnings', value: Array.from(data.warnedUsers.values()).reduce((a, b) => a + b, 0).toString(), inline: true }
+                { name: 'Whitelisted Users', value: whitelistedUsers.toString(), inline: true },
+                { name: 'Total Warnings', value: totalWarnings.toString(), inline: true }
             )
             .setTimestamp();
             
@@ -1322,17 +1409,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (commandName === 'clear_warnings') {
         const user = options.getUser('user');
         if (user) {
-            data.warnedUsers.delete(user.id);
-            saveData();
+            const success = await clearWarnings(user.id, interaction.guild.id);
             
-            const embed = new EmbedBuilder()
-                .setColor(0x00FF00)
-                .setTitle('✅ Warnings Cleared')
-                .setDescription(`Cleared warnings for ${user.tag}`)
-                .setTimestamp();
-                
-            await interaction.reply({ embeds: [embed] });
-            await logAction('WARNINGS_CLEARED', `${interaction.user.tag} cleared warnings for ${user.tag}`, 0x00FF00, interaction.user);
+            if (success) {
+                const embed = new EmbedBuilder()
+                    .setColor(0x00FF00)
+                    .setTitle('✅ Warnings Cleared')
+                    .setDescription(`Cleared warnings for ${user.tag}`)
+                    .setTimestamp();
+                    
+                await interaction.reply({ embeds: [embed] });
+                await logAction('WARNINGS_CLEARED', `${interaction.user.tag} cleared warnings for ${user.tag}`, 0x00FF00, interaction.user);
+            } else {
+                await interaction.reply({ 
+                    content: '❌ Failed to clear warnings.', 
+                    ephemeral: true 
+                });
+            }
         }
     }
     
@@ -1394,6 +1487,30 @@ client.on(Events.InteractionCreate, async (interaction) => {
             
         await interaction.editReply({ embeds: [embed] });
         await logAction('ROLES_SETUP', `${interaction.user.tag} setup security roles`, 0x00FF00, interaction.user);
+    }
+    
+    if (commandName === 'view_warnings') {
+        const user = options.getUser('user') || interaction.user;
+        
+        const warnings = await getWarnings(user.id, interaction.guild.id);
+        
+        if (warnings.length === 0) {
+            await interaction.reply(`${user.tag} has no warnings.`);
+            return;
+        }
+        
+        const warningList = warnings.map((w, i) => 
+            `**${i+1}.** ${w.reason} - <t:${Math.floor(w.timestamp.getTime() / 1000)}:R>`
+        ).join('\n');
+        
+        const embed = new EmbedBuilder()
+            .setColor(0xFFA500)
+            .setTitle(`⚠️ Warnings for ${user.tag}`)
+            .setDescription(warningList)
+            .setFooter({ text: `Total: ${warnings.length} warnings` })
+            .setTimestamp();
+            
+        await interaction.reply({ embeds: [embed] });
     }
 });
 
@@ -1562,6 +1679,18 @@ client.on(Events.ClientReady, async () => {
             ]
         },
         {
+            name: 'view_warnings',
+            description: 'View warnings for a user',
+            options: [
+                {
+                    name: 'user',
+                    type: 6,
+                    description: 'The user to view warnings for',
+                    required: false
+                }
+            ]
+        },
+        {
             name: 'welcome_test',
             description: 'Test the welcome message'
         },
@@ -1622,13 +1751,13 @@ client.on(Events.ClientReady, async () => {
 process.on('SIGINT', async () => {
   console.log('Shutting down gracefully...');
   
-  // Save data before exiting
-  saveData();
-  
   // Destroy client
   if (client && client.destroy) {
     client.destroy();
   }
+  
+  // Close MongoDB connection
+  mongoose.connection.close();
   
   process.exit(0);
 });
@@ -1636,13 +1765,13 @@ process.on('SIGINT', async () => {
 process.on('SIGTERM', async () => {
   console.log('Received SIGTERM, shutting down gracefully...');
   
-  // Save data before exiting
-  saveData();
-  
   // Destroy client
   if (client && client.destroy) {
     client.destroy();
   }
+  
+  // Close MongoDB connection
+  mongoose.connection.close();
   
   process.exit(0);
 });
@@ -1659,8 +1788,6 @@ process.on('unhandledRejection', (error) => {
 // Auto-restart mechanism (for unexpected crashes)
 process.on('uncaughtException', (error) => {
     console.error('❌ Uncaught exception:', error);
-    // Save data before crashing
-    saveData();
     process.exit(1);
 });
 
