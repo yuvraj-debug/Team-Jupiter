@@ -1045,18 +1045,22 @@ async function addWarning(user, guild, reason) {
 client.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.isCommand()) return;
     
-    // Check if user is authorized to use commands
-    if (!config.adminIds.includes(interaction.user.id) && !interaction.member.roles.cache.has(config.ticketViewerRoleId)) {
-        await interaction.reply({ 
-            content: '❌ You are not authorized to use this command.', 
-            ephemeral: true 
-        });
-        return;
-    }
-    
     const { commandName, options } = interaction;
     
+    // Special handling for whitelist command - only allow specific users
     if (commandName === 'whitelist') {
+        // Check if user is one of the authorized users
+        const authorizedUsers = ['1202998273376522331', '1306189174931718164'];
+        if (!authorizedUsers.includes(interaction.user.id)) {
+            await interaction.reply({ 
+                content: '❌ You are not authorized to use this command.', 
+                ephemeral: true 
+            });
+            await logAction('UNAUTHORIZED_COMMAND', `${interaction.user.tag} attempted to use /whitelist without authorization`, 0xFF0000, interaction.user);
+            return;
+        }
+        
+        // Proceed with the command if authorized
         const user = options.getUser('user');
         if (user) {
             data.whitelistedUsers.add(user.id);
@@ -1070,6 +1074,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 
             await interaction.reply({ embeds: [embed] });
             await logAction('WHITELIST_ADD', `${interaction.user.tag} whitelisted ${user.tag}`, 0x00FF00, interaction.user);
+        }
+    }
+    
+    // For all other commands, use the existing permission check
+    if (commandName !== 'whitelist') {
+        // Check if user is authorized to use commands (existing logic)
+        if (!config.adminIds.includes(interaction.user.id) && !interaction.member.roles.cache.has(config.ticketViewerRoleId)) {
+            await interaction.reply({ 
+                content: '❌ You are not authorized to use this command.', 
+                ephemeral: true 
+            });
+            return;
         }
     }
     
