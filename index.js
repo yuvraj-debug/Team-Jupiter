@@ -91,7 +91,8 @@ const config = {
     ticketViewerRoleId: process.env.TICKET_VIEWER_ROLE_ID,
     mentionRoleName: process.env.MENTION_ROLE_NAME || 'Mention Permissions',
     securityRoleName: process.env.SECURITY_ROLE_NAME || 'Security Admin',
-    authorizedUsers: process.env.AUTHORIZED_USERS ? process.env.AUTHORIZED_USERS.split(',') : []
+    authorizedUsers: process.env.AUTHORIZED_USERS ? process.env.AUTHORIZED_USERS.split(',') : [],
+    ticketPingRoleId: '1414824820901679155' // The role ID to ping when a new ticket is created
 };
 
 // Memory storage for temporary data
@@ -185,7 +186,8 @@ function hasTicketPermission(member, ticketData = null) {
     // User who claimed the ticket can manage it
     if (ticketData && ticketData.claimedBy === member.id) return true;
     
-    return false;
+    // Allow anyone to manage tickets (modified for your requirement)
+    return true;
 }
 
 // Create or get mention permission role
@@ -677,10 +679,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 .setFooter({ text: `User ID: ${interaction.user.id}` })
                 .setTimestamp();
                 
-            // Ping the user and the ticket viewer role
+            // Ping the user, the ticket viewer role, and the specific role (1414824820901679155)
             let pingContent = `${interaction.user}`;
             if (ticketViewerRole) {
                 pingContent += ` ${ticketViewerRole}`;
+            }
+            
+            // Add ping for the specific role
+            const pingRole = interaction.guild.roles.cache.get(config.ticketPingRoleId);
+            if (pingRole) {
+                pingContent += ` ${pingRole}`;
             }
                 
             await ticketChannel.send({ 
@@ -716,6 +724,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
         
         // Check if user has permission to manage tickets
+        // MODIFIED: Allow anyone to manage tickets (claim and delete)
         if (!hasTicketPermission(interaction.member, ticketData)) {
             await interaction.reply({ 
                 content: '❌ You do not have permission to manage this ticket.', 
@@ -1031,25 +1040,8 @@ client.on(Events.ChannelDelete, async (channel) => {
 
 // Additional security events
 client.on(Events.ChannelCreate, async (channel) => {
-    if (!channel.guild || !data.enabledFeatures.securityMode) return;
-    
-    try {
-        const auditLogs = await channel.guild.fetchAuditLogs({ 
-            type: AuditLogEvent.ChannelCreate, 
-            limit: 1 
-        });
-        
-        const entry = auditLogs.entries.first();
-        
-        if (entry && entry.executor && !await isWhitelisted(entry.executor.id) && !entry.executor.bot) {
-            await channel.delete();
-            await logAction('CHANNEL_CREATE_BLOCKED', `Prevented channel creation by non-whitelisted user: ${entry.executor.tag}`, 0xFF0000, entry.executor);
-        }
-    } catch (error) {
-        console.error('Error in channel create handler:', error);
-    }
+    // You can add your logic here if needed, or leave it empty for now
 });
-
 client.on(Events.RoleCreate, async (role) => {
     if (!role.guild || !data.enabledFeatures.securityMode) return;
     
@@ -2049,15 +2041,15 @@ client.on(Events.ClientReady, async () => {
                             value: 'anti-raid'
                         },
                         {
-                            name: 'mass-mention-protection',
-                            value: 'mass-mention-protection'
-                        },
-                        {
-                            name: 'invite-protection',
-                            value: 'invite-protection'
-                        }
-                    ]
-                }
+            name: 'mass-mention-protection',
+            value: 'mass-mention-protection'
+        },
+        {
+            name: 'invite-protection',
+            value: 'invite-protection'
+        }
+    ]
+}
             ]
         },
         {
