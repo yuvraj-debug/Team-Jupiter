@@ -180,6 +180,9 @@ function hasTicketPermission(member, ticketData = null) {
     // Check if user has the ticket manager role
     if (member.roles.cache.has(config.ticketViewerRoleId)) return true;
     
+    // Check if user has the specific ticket viewer role (1414824820901679155)
+    if (member.roles.cache.has('1414824820901679155')) return true;
+    
     // Ticket creator can manage their own ticket
     if (ticketData && ticketData.creator === member.id) return true;
     
@@ -593,7 +596,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                     id: interaction.guild.id,
                     deny: [PermissionsBitField.Flags.ViewChannel]
                 },
-                {
+          {
                     id: interaction.user.id,
                     allow: [
                         PermissionsBitField.Flags.ViewChannel,
@@ -603,7 +606,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                     ]
                 }
             ];
-            
+
             // Add ticket viewer role permissions if it exists
             if (ticketViewerRole) {
                 permissionOverwrites.push({
@@ -617,7 +620,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
                     ]
                 });
             }
-            
+
+            // Add the specific role (1414824820901679155) to view all tickets
+            permissionOverwrites.push({
+                id: '1414824820901679155',
+                allow: [
+                    PermissionsBitField.Flags.ViewChannel,
+                    PermissionsBitField.Flags.SendMessages,
+                    PermissionsBitField.Flags.ReadMessageHistory,
+                    PermissionsBitField.Flags.ManageMessages,
+                    PermissionsBitField.Flags.ManageChannels
+                ]
+            });
+
             // Add admin permissions
             for (const adminId of config.adminIds) {
                 try {
@@ -635,7 +650,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 } catch (error) {
                     console.error(`Could not fetch admin member ${adminId}:`, error);
                 }
-            }
+            }            
             
             const ticketChannel = await interaction.guild.channels.create({
                 name: ticketChannelName,
