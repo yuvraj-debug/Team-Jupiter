@@ -2102,8 +2102,8 @@ client.on('messageCreate', async (message) => {
 // Register Slash Commands
 client.on('ready', async () => {
     try {
-        // Guild-specific commands
-        const guild = client.guilds.cache.get(process.env.GUILD_ID);
+        // Register commands for your specific guild for faster updates
+        const guild = client.guilds.cache.get('1414523813345099828');
         if (!guild) {
             console.error('Guild not found!');
             return;
@@ -2328,7 +2328,7 @@ client.on('ready', async () => {
             }
         ]);
         
-        console.log('Slash commands registered!');
+        console.log('Slash commands registered for guild!');
     } catch (error) {
         console.error('Error registering commands:', error);
     }
