@@ -296,18 +296,25 @@ async function backupServerState(guild, backupName = 'Manual Backup') {
 
         // Backup channels
         guild.channels.cache.forEach(channel => {
+            const overwrites = [];
+            if (channel.permissionOverwrites && channel.permissionOverwrites.cache) {
+                channel.permissionOverwrites.cache.forEach(overwrite => {
+                    overwrites.push({
+                        id: overwrite.id,
+                        type: overwrite.type,
+                        allow: overwrite.allow ? overwrite.allow.bitfield.toString() : '0',
+                        deny: overwrite.deny ? overwrite.deny.bitfield.toString() : '0'
+                    });
+                });
+            }
+            
             backupData.channels.push({
                 id: channel.id,
                 name: channel.name,
                 type: channel.type,
                 parent: channel.parentId,
                 position: channel.position,
-                permissionOverwrites: channel.permissionOverwrites.cache.map(overwrite => ({
-                    id: overwrite.id,
-                    type: overwrite.type,
-                    allow: overwrite.allow ? overwrite.allow.bitfield.toString() : '0',
-                    deny: overwrite.deny ? overwrite.deny.bitfield.toString() : '0'
-                })),
+                permissionOverwrites: overwrites,
                 topic: channel.topic || '',
                 nsfw: channel.nsfw || false,
                 rateLimitPerUser: channel.rateLimitPerUser || 0,
@@ -387,8 +394,8 @@ async function restoreBackup(guild, backupId) {
                         position: roleData.position,
                         permissions: BigInt(roleData.permissions),
                         mentionable: roleData.mentionable,
-                        icon: roleData.icon,
-                        unicodeEmoji: roleData.unicodeEmoji
+                        icon: roleData.icon || null,
+                        unicodeEmoji: roleData.unicodeEmoji || null
                     });
                     restoredItems.roles.push(existingRole);
                 } else {
@@ -400,8 +407,8 @@ async function restoreBackup(guild, backupId) {
                         position: roleData.position,
                         permissions: BigInt(roleData.permissions),
                         mentionable: roleData.mentionable,
-                        icon: roleData.icon,
-                        unicodeEmoji: roleData.unicodeEmoji
+                        icon: roleData.icon || null,
+                        unicodeEmoji: roleData.unicodeEmoji || null
                     });
                     restoredItems.roles.push(newRole);
                 }
@@ -435,8 +442,8 @@ async function restoreBackup(guild, backupId) {
                     for (const overwriteData of channelData.permissionOverwrites) {
                         try {
                             await existingChannel.permissionOverwrites.edit(overwriteData.id, {
-                                allow: BigInt(overwriteData.allow),
-                                deny: BigInt(overwriteData.deny)
+                                allow: BigInt(overwriteData.allow || '0'),
+                                deny: BigInt(overwriteData.deny || '0')
                             });
                         } catch (error) {
                             console.error(`Error restoring permissions for channel ${channelData.name}:`, error);
@@ -466,8 +473,8 @@ async function restoreBackup(guild, backupId) {
                     for (const overwriteData of channelData.permissionOverwrites) {
                         try {
                             await newChannel.permissionOverwrites.edit(overwriteData.id, {
-                                allow: BigInt(overwriteData.allow),
-                                deny: BigInt(overwriteData.deny)
+                                allow: BigInt(overwriteData.allow || '0'),
+                                deny: BigInt(overwriteData.deny || '0')
                             });
                         } catch (error) {
                             console.error(`Error restoring permissions for channel ${channelData.name}:`, error);
