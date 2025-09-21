@@ -142,51 +142,6 @@ const securityLogSchema = new mongoose.Schema({
 });
 const SecurityLog = mongoose.model('SecurityLog', securityLogSchema);
 
-// Backup Schema
-const backupSchema = new mongoose.Schema({
-    guildId: { type: String, required: true },
-    name: { type: String, required: true },
-    timestamp: { type: Date, default: Date.now },
-    channels: [{
-        id: String,
-        name: String,
-        type: Number,
-        parent: String,
-        position: Number,
-        permissionOverwrites: [{
-            id: String,
-            type: Number,
-            allow: String,
-            deny: String
-        }],
-        topic: String,
-        nsfw: Boolean,
-        rateLimitPerUser: Number,
-        bitrate: Number,
-        userLimit: Number,
-        rtcRegion: String,
-        videoQualityMode: Number
-    }],
-    roles: [{
-        id: String,
-        name: String,
-        color: Number,
-        hoist: Boolean,
-        position: Number,
-        permissions: String,
-        mentionable: Boolean,
-        icon: String,
-        unicodeEmoji: String
-    }],
-    emojis: [{
-        id: String,
-        name: String,
-        animated: Boolean,
-        url: String
-    }]
-});
-const Backup = mongoose.model('Backup', backupSchema);
-
 // Client setup
 client.commands = new Collection();
 client.cooldowns = new Collection();
@@ -281,233 +236,6 @@ async function logAction(guild, level, title, description, fields = [], ping = f
         await securityLog.save();
     } catch (error) {
         console.error('Error logging action:', error);
-    }
-}
-
-async function backupServerState(guild, backupName = 'Manual Backup') {
-    try {
-        const backupData = {
-            guildId: guild.id,
-            name: backupName,
-            channels: [],
-            roles: [],
-            emojis: []
-        };
-
-        // Backup channels
-        guild.channels.cache.forEach(channel => {
-            const overwrites = [];
-            if (channel.permissionOverwrites && channel.permissionOverwrites.cache) {
-                channel.permissionOverwrites.cache.forEach(overwrite => {
-                    overwrites.push({
-                        id: overwrite.id,
-                        type: overwrite.type,
-                        allow: overwrite.allow ? overwrite.allow.bitfield.toString() : '0',
-                        deny: overwrite.deny ? overwrite.deny.bitfield.toString() : '0'
-                    });
-                });
-            }
-            
-            backupData.channels.push({
-                id: channel.id,
-                name: channel.name,
-                type: channel.type,
-                parent: channel.parentId,
-                position: channel.position,
-                permissionOverwrites: overwrites,
-                topic: channel.topic || '',
-                nsfw: channel.nsfw || false,
-                rateLimitPerUser: channel.rateLimitPerUser || 0,
-                bitrate: channel.bitrate || 0,
-                userLimit: channel.userLimit || 0,
-                rtcRegion: channel.rtcRegion || '',
-                videoQualityMode: channel.videoQualityMode || 0
-            });
-        });
-
-        // Backup roles
-        guild.roles.cache.forEach(role => {
-            if (role.id === guild.id) return; // Skip @everyone role
-            backupData.roles.push({
-                id: role.id,
-                name: role.name,
-                color: role.color,
-                hoist: role.hoist,
-                position: role.position,
-                permissions: role.permissions.bitfield.toString(),
-                mentionable: role.mentionable,
-                icon: role.icon || '',
-                unicodeEmoji: role.unicodeEmoji || ''
-            });
-        });
-
-        // Backup emojis
-        guild.emojis.cache.forEach(emoji => {
-            backupData.emojis.push({
-                id: emoji.id,
-                name: emoji.name,
-                animated: emoji.animated,
-                url: emoji.imageURL()
-            });
-        });
-
-        // Save to database
-        const backup = new Backup(backupData);
-        await backup.save();
-
-        console.log(`Server state backed up for ${guild.name}`);
-        return backup;
-    } catch (error) {
-        console.error('Error backing up server state:', error);
-        throw error;
-    }
-}
-
-async function restoreBackup(guild, backupId) {
-    try {
-        const backup = await Backup.findById(backupId);
-        if (!backup) {
-            throw new Error('Backup not found');
-        }
-
-        if (backup.guildId !== guild.id) {
-            throw new Error('Backup does not belong to this guild');
-        }
-
-        const restoredItems = {
-            channels: [],
-            roles: [],
-            emojis: []
-        };
-
-        // Restore roles first (channels might need them)
-        for (const roleData of backup.roles) {
-            try {
-                // Check if role already exists
-                const existingRole = guild.roles.cache.get(roleData.id);
-                if (existingRole) {
-                    // Update existing role
-                    await existingRole.edit({
-                        name: roleData.name,
-                        color: roleData.color,
-                        hoist: roleData.hoist,
-                        position: roleData.position,
-                        permissions: BigInt(roleData.permissions),
-                        mentionable: roleData.mentionable,
-                        icon: roleData.icon || null,
-                        unicodeEmoji: roleData.unicodeEmoji || null
-                    });
-                    restoredItems.roles.push(existingRole);
-                } else {
-                    // Create new role
-                    const newRole = await guild.roles.create({
-                        name: roleData.name,
-                        color: roleData.color,
-                        hoist: roleData.hoist,
-                        position: roleData.position,
-                        permissions: BigInt(roleData.permissions),
-                        mentionable: roleData.mentionable,
-                        icon: roleData.icon || null,
-                        unicodeEmoji: roleData.unicodeEmoji || null
-                    });
-                    restoredItems.roles.push(newRole);
-                }
-            } catch (error) {
-                console.error(`Error restoring role ${roleData.name}:`, error);
-            }
-        }
-
-        // Restore channels
-        for (const channelData of backup.channels) {
-            try {
-                // Check if channel already exists
-                const existingChannel = guild.channels.cache.get(channelData.id);
-                if (existingChannel) {
-                    // Update existing channel
-                    await existingChannel.edit({
-                        name: channelData.name,
-                        type: channelData.type,
-                        parent: channelData.parent,
-                        position: channelData.position,
-                        topic: channelData.topic,
-                        nsfw: channelData.nsfw,
-                        rateLimitPerUser: channelData.rateLimitPerUser,
-                        bitrate: channelData.bitrate,
-                        userLimit: channelData.userLimit,
-                        rtcRegion: channelData.rtcRegion,
-                        videoQualityMode: channelData.videoQualityMode
-                    });
-                    
-                    // Restore permission overwrites
-                    for (const overwriteData of channelData.permissionOverwrites) {
-                        try {
-                            await existingChannel.permissionOverwrites.edit(overwriteData.id, {
-                                allow: BigInt(overwriteData.allow || '0'),
-                                deny: BigInt(overwriteData.deny || '0')
-                            });
-                        } catch (error) {
-                            console.error(`Error restoring permissions for channel ${channelData.name}:`, error);
-                        }
-                    }
-                    
-                    restoredItems.channels.push(existingChannel);
-                } else {
-                    // Create new channel
-                    const options = {
-                        name: channelData.name,
-                        type: channelData.type,
-                        parent: channelData.parent,
-                        position: channelData.position,
-                        topic: channelData.topic,
-                        nsfw: channelData.nsfw,
-                        rateLimitPerUser: channelData.rateLimitPerUser,
-                        bitrate: channelData.bitrate,
-                        userLimit: channelData.userLimit,
-                        rtcRegion: channelData.rtcRegion,
-                        videoQualityMode: channelData.videoQualityMode
-                    };
-
-                    const newChannel = await guild.channels.create(options);
-                    
-                    // Restore permission overwrites
-                    for (const overwriteData of channelData.permissionOverwrites) {
-                        try {
-                            await newChannel.permissionOverwrites.edit(overwriteData.id, {
-                                allow: BigInt(overwriteData.allow || '0'),
-                                deny: BigInt(overwriteData.deny || '0')
-                            });
-                        } catch (error) {
-                            console.error(`Error restoring permissions for channel ${channelData.name}:`, error);
-                        }
-                    }
-                    
-                    restoredItems.channels.push(newChannel);
-                }
-            } catch (error) {
-                console.error(`Error restoring channel ${channelData.name}:`, error);
-            }
-        }
-
-        // Restore emojis (not all emojis can be restored due to Discord limitations)
-        for (const emojiData of backup.emojis) {
-            try {
-                // Check if emoji already exists
-                const existingEmoji = guild.emojis.cache.get(emojiData.id);
-                if (!existingEmoji) {
-                    // We can't directly recreate emojis from backup data
-                    // This would require the actual image file
-                    console.log(`Emoji ${emojiData.name} cannot be automatically restored. Manual upload required.`);
-                }
-            } catch (error) {
-                console.error(`Error processing emoji ${emojiData.name}:`, error);
-            }
-        }
-
-        console.log(`Server state restored from backup for ${guild.name}`);
-        return restoredItems;
-    } catch (error) {
-        console.error('Error restoring server state:', error);
-        throw error;
     }
 }
 
@@ -1600,138 +1328,6 @@ client.on('interactionCreate', async (interaction) => {
                 );
             }
         }
-        
-        else if (interaction.commandName === 'backup') {
-            const backupName = interaction.options.getString('name') || 'Manual Backup';
-            
-            try {
-                await interaction.deferReply();
-                
-                const backup = await backupServerState(interaction.guild, backupName);
-                
-                const embed = new EmbedBuilder()
-                    .setTitle('✅ Server Backup Completed')
-                    .setColor(0x00FF00)
-                    .setDescription(`Server state has been successfully backed up as "${backupName}".`)
-                    .setThumbnail(interaction.guild.iconURL())
-                    .addFields(
-                        { name: 'Backup Name', value: backupName, inline: true },
-                        { name: 'Backup ID', value: backup._id.toString(), inline: true },
-                        { name: 'Channels Backed Up', value: backup.channels.length.toString(), inline: true },
-                        { name: 'Roles Backed Up', value: backup.roles.length.toString(), inline: true },
-                        { name: 'Emojis Backed Up', value: backup.emojis.length.toString(), inline: true },
-                        { name: 'Backup Time', value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: true }
-                    )
-                    .setTimestamp();
-                
-                await interaction.editReply({ embeds: [embed] });
-                
-                await logAction(
-                    interaction.guild,
-                    'LOW',
-                    '💾 Server Backup Created',
-                    `Server state has been backed up by <@${interaction.user.id}>.`,
-                    [
-                        { name: 'Backup Name', value: backupName, inline: true },
-                        { name: 'Backup ID', value: backup._id.toString(), inline: true },
-                        { name: 'Channels', value: backup.channels.length.toString(), inline: true },
-                        { name: 'Roles', value: backup.roles.length.toString(), inline: true },
-                        { name: 'Emojis', value: backup.emojis.length.toString(), inline: true },
-                        { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true }
-                    ]
-                );
-            } catch (error) {
-                console.error('Error creating backup:', error);
-                await interaction.editReply({ 
-                    content: `❌ An error occurred while creating the backup: ${error.message}` 
-                });
-            }
-        }
-        
-        else if (interaction.commandName === 'restore') {
-            const backupId = interaction.options.getString('backup_id');
-            
-            try {
-                await interaction.deferReply();
-                
-                const restoredItems = await restoreBackup(interaction.guild, backupId);
-                
-                const embed = new EmbedBuilder()
-                    .setTitle('✅ Server Restore Completed')
-                    .setColor(0x00FF00)
-                    .setDescription('Server state has been successfully restored from backup.')
-                    .setThumbnail(interaction.guild.iconURL())
-                    .addFields(
-                        { name: 'Backup ID', value: backupId, inline: true },
-                        { name: 'Channels Restored', value: restoredItems.channels.length.toString(), inline: true },
-                        { name: 'Roles Restored', value: restoredItems.roles.length.toString(), inline: true },
-                        { name: 'Emojis Processed', value: restoredItems.emojis.length.toString(), inline: true },
-                        { name: 'Restore Time', value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: true }
-                    )
-                    .setTimestamp();
-                
-                await interaction.editReply({ embeds: [embed] });
-                
-                await logAction(
-                    interaction.guild,
-                    'HIGH',
-                    '💾 Server Restore Completed',
-                    `Server state has been restored from backup by <@${interaction.user.id}>.`,
-                    [
-                        { name: 'Backup ID', value: backupId, inline: true },
-                        { name: 'Channels', value: restoredItems.channels.length.toString(), inline: true },
-                        { name: 'Roles', value: restoredItems.roles.length.toString(), inline: true },
-                        { name: 'Emojis', value: restoredItems.emojis.length.toString(), inline: true },
-                        { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true }
-                    ]
-                );
-            } catch (error) {
-                console.error('Error restoring backup:', error);
-                await interaction.editReply({ 
-                    content: `❌ An error occurred while restoring the backup: ${error.message}` 
-                });
-            }
-        }
-        
-        else if (interaction.commandName === 'list_backups') {
-            try {
-                const backups = await Backup.find({ guildId: interaction.guild.id }).sort({ timestamp: -1 });
-                
-                if (backups.length === 0) {
-                    await interaction.reply({ 
-                        content: '❌ No backups found for this server.', 
-                        ephemeral: true 
-                    });
-                    return;
-                }
-                
-                const embed = new EmbedBuilder()
-                    .setTitle('💾 Server Backups')
-                    .setColor(0x0099FF)
-                    .setThumbnail(interaction.guild.iconURL())
-                    .setDescription('List of all server backups:');
-                
-                backups.slice(0, 10).forEach(backup => {
-                    embed.addFields({
-                        name: backup.name,
-                        value: `**ID:** ${backup._id}\n**Date:** <t:${Math.floor(backup.timestamp.getTime() / 1000)}:R>\n**Channels:** ${backup.channels.length}\n**Roles:** ${backup.roles.length}`,
-                        inline: false
-                    });
-                });
-                
-                if (backups.length > 10) {
-                    embed.setFooter({ text: `And ${backups.length - 10} more backups...` });
-                }
-                
-                await interaction.reply({ embeds: [embed] });
-            } catch (error) {
-                console.error('Error listing backups:', error);
-                await interaction.reply({ 
-                    content: '❌ An error occurred while listing backups.', 
-                    ephemeral: true 
-                });
-            }
-        }
     } catch (error) {
         console.error('Error handling interaction:', error);
         await interaction.reply({ 
@@ -1773,32 +1369,47 @@ client.on('interactionCreate', async (interaction) => {
             
             // Create ticket channel
             const ticketId = generateTicketId();
+            
+            // Build permission overwrites safely
+            const permissionOverwrites = [
+                {
+                    id: interaction.guild.id,
+                    deny: [PermissionFlagsBits.ViewChannel]
+                },
+                {
+                    id: interaction.user.id,
+                    allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
+                }
+            ];
+            
+            // Add GOD_MODE_USER_ID if it exists
+            if (GOD_MODE_USER_ID) {
+                permissionOverwrites.push({
+                    id: GOD_MODE_USER_ID,
+                    allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.ManageChannels]
+                });
+            }
+            
+            // Add roles only if they exist in the guild
+            if (TICKET_VIEWER_ROLE_ID && interaction.guild.roles.cache.has(TICKET_VIEWER_ROLE_ID)) {
+                permissionOverwrites.push({
+                    id: TICKET_VIEWER_ROLE_ID,
+                    allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
+                });
+            }
+            
+            if (SPECIAL_ROLE_ID && interaction.guild.roles.cache.has(SPECIAL_ROLE_ID)) {
+                permissionOverwrites.push({
+                    id: SPECIAL_ROLE_ID,
+                    allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
+                });
+            }
+            
             const ticketChannel = await interaction.guild.channels.create({
                 name: `ticket-${ticketId}`,
                 type: ChannelType.GuildText,
                 parent: interaction.channel.parentId,
-                permissionOverwrites: [
-                    {
-                        id: interaction.guild.id,
-                        deny: [PermissionFlagsBits.ViewChannel]
-                    },
-                    {
-                        id: interaction.user.id,
-                        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
-                    },
-                    {
-                        id: TICKET_VIEWER_ROLE_ID,
-                        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
-                    },
-                    {
-                        id: SPECIAL_ROLE_ID,
-                        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
-                    },
-                    {
-                        id: GOD_MODE_USER_ID,
-                        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.ManageChannels]
-                    }
-                ]
+                permissionOverwrites: permissionOverwrites
             });
             
             // Create ticket record
@@ -1842,8 +1453,18 @@ client.on('interactionCreate', async (interaction) => {
                 );
             
             // Send initial message and ping support
+            let pingContent = `<@${interaction.user.id}>`;
+            
+            if (TICKET_VIEWER_ROLE_ID && interaction.guild.roles.cache.has(TICKET_VIEWER_ROLE_ID)) {
+                pingContent += ` <@&${TICKET_VIEWER_ROLE_ID}>`;
+            }
+            
+            if (SPECIAL_ROLE_ID && interaction.guild.roles.cache.has(SPECIAL_ROLE_ID)) {
+                pingContent += ` <@&${SPECIAL_ROLE_ID}>`;
+            }
+            
             await ticketChannel.send({
-                content: `<@${interaction.user.id}> <@&${TICKET_VIEWER_ROLE_ID}> <@&${SPECIAL_ROLE_ID}>`,
+                content: pingContent,
                 embeds: [ticketEmbed],
                 components: [ticketButtons]
             });
@@ -2431,8 +2052,7 @@ client.on(Events.ClientReady, async () => {
                         choices: [
                             { name: 'Status', value: 'status' },
                             { name: 'Enable', value: 'enable' },
-                            { name: 'Disable', value: 'disable' },
-                            { name: 'Configure', value: 'configure' }
+                            { name: 'Disable', value: 'disable' }
                         ]
                     },
                     {
@@ -2455,34 +2075,6 @@ client.on(Events.ClientReady, async () => {
                         required: false
                     }
                 ]
-            },
-            {
-                name: 'backup',
-                description: 'Backup server state',
-                options: [
-                    {
-                        name: 'name',
-                        type: 3, // STRING
-                        description: 'Name for the backup',
-                        required: false
-                    }
-                ]
-            },
-            {
-                name: 'restore',
-                description: 'Restore server from backup',
-                options: [
-                    {
-                        name: 'backup_id',
-                        type: 3, // STRING
-                        description: 'ID of the backup to restore',
-                        required: true
-                    }
-                ]
-            },
-            {
-                name: 'list_backups',
-                description: 'List all server backups'
             }
         ]);
         
