@@ -613,9 +613,6 @@ async function monitorAuditLogs(guild) {
             // Skip if executor is a bot (unless it's our bot)
             if (entry.executor.bot && entry.executor.id !== client.user.id) continue;
             
-            // Enhanced audit log logging with better UI
-            await logAuditAction(guild, entry);
-            
             // Track different types of actions
             if ([AuditLogEvent.ChannelCreate, AuditLogEvent.ChannelDelete, 
                  AuditLogEvent.RoleCreate, AuditLogEvent.RoleDelete, 
@@ -722,9 +719,26 @@ async function monitorAuditLogs(guild) {
     }
 }
 
-// Enhanced audit log logging with better UI
+// Enhanced audit log logging with better UI - Only log specific actions
 async function logAuditAction(guild, entry) {
     try {
+        // Only log specific action types
+        const actionTypesToLog = [
+            AuditLogEvent.ChannelCreate,
+            AuditLogEvent.ChannelDelete,
+            AuditLogEvent.RoleCreate,
+            AuditLogEvent.RoleDelete,
+            AuditLogEvent.MemberBanAdd,
+            AuditLogEvent.MemberBanRemove,
+            AuditLogEvent.MemberKick,
+            AuditLogEvent.MemberUpdate,
+            AuditLogEvent.MemberRoleUpdate
+        ];
+        
+        if (!actionTypesToLog.includes(entry.action)) {
+            return; // Skip logging for this action type
+        }
+        
         const settings = await getGuildSettings(guild.id);
         const logChannelId = settings.logChannelId;
         if (!logChannelId) return;
@@ -750,12 +764,6 @@ async function logAuditAction(guild, entry) {
                 emoji = '🗑️';
                 targetInfo = `**Name:** ${entry.target.name}\n**Type:** ${ChannelType[entry.target.type]}`;
                 break;
-            case AuditLogEvent.ChannelUpdate:
-                actionType = 'Channel Updated';
-                color = 0xFFFF00;
-                emoji = '✏️';
-                targetInfo = `**Channel:** ${entry.target}`;
-                break;
             case AuditLogEvent.RoleCreate:
                 actionType = 'Role Created';
                 color = 0x00FF00;
@@ -767,12 +775,6 @@ async function logAuditAction(guild, entry) {
                 color = 0xFF0000;
                 emoji = '🗑️';
                 targetInfo = `**Name:** ${entry.target.name}`;
-                break;
-            case AuditLogEvent.RoleUpdate:
-                actionType = 'Role Updated';
-                color = 0xFFFF00;
-                emoji = '✏️';
-                targetInfo = `**Role:** ${entry.target}`;
                 break;
             case AuditLogEvent.MemberBanAdd:
                 actionType = 'Member Banned';
@@ -798,15 +800,28 @@ async function logAuditAction(guild, entry) {
                 emoji = '👤';
                 targetInfo = `**User:** <@${entry.target.id}>\n**ID:** ${entry.target.id}`;
                 break;
-            case AuditLogEvent.MessageDelete:
-                actionType = 'Message Deleted';
-                color = 0xFF0000;
-                emoji = '🗑️';
-                targetInfo = `**Channel:** <#${entry.extra.channel.id}>\n**Count:** ${entry.extra.count}`;
+            case AuditLogEvent.MemberRoleUpdate:
+                actionType = 'Member Roles Updated';
+                color = 0xFFFF00;
+                emoji = '🎭';
+                
+                // Get added and removed roles
+                const addedRoles = entry.changes.filter(change => change.key === '$add').map(change => change.new);
+                const removedRoles = entry.changes.filter(change => change.key === '$remove').map(change => change.new);
+                
+                targetInfo = `**User:** <@${entry.target.id}>\n**ID:** ${entry.target.id}`;
+                
+                if (addedRoles.length > 0) {
+                    targetInfo += `\n**Added Roles:** ${addedRoles.map(role => `<@&${role.id}>`).join(', ')}`;
+                }
+                
+                if (removedRoles.length > 0) {
+                    targetInfo += `\n**Removed Roles:** ${removedRoles.map(role => `<@&${role.id}>`).join(', ')}`;
+                }
                 break;
             default:
-                actionType = 'Unknown Action';
-                break;
+                // Skip unknown actions to prevent spam
+                return;
         }
 
         const embed = new EmbedBuilder()
@@ -1482,18 +1497,18 @@ client.on('interactionCreate', async (interaction) => {
                 const settings = await getGuildSettings(interaction.guild.id);
                 
                 const embed = new EmbedBuilder()
-                    .setTitle('🛡️ Anti-Nuke System Status')
-                    .setColor(0x0099FF)
-                    .setThumbnail(interaction.guild.iconURL())
-                    .addFields(
-                        { name: 'Status', value: settings.antiNukeEnabled ? '✅ Enabled' : '❌ Disabled', inline: true },
-                        { name: 'Channel Create Limit', value: settings.maxChannelCreate.toString(), inline: true },
-                        { name: 'Channel Delete Limit', value: settings.maxChannelDelete.toString(), inline: true },
-                        { name: 'Role Create Limit', value: settings.maxRoleCreate.toString(), inline: true },
-                        { name: 'Role Delete Limit', value: settings.maxRoleDelete.toString(), inline: true },
-                        { name: 'Ban Limit', value: settings.maxBanAdd.toString(), inline: true }
-                    )
-                    .setTimestamp();
+                .setTitle('🛡️ Anti-Nuke System Status')
+                .setColor(0x0099FF)
+                .setThumbnail(interaction.guild.iconURL())
+                .addFields(
+                    { name: 'Status', value: settings.antiNukeEnabled ? '✅ Enabled' : '❌ Disabled', inline: true },
+                    { name: 'Channel Create Limit', value: settings.maxChannelCreate.toString(), inline: true },
+                    { name: 'Channel Delete Limit', value: settings.maxChannelDelete.toString(), inline: true },
+                    { name: 'Role Create Limit', value: settings.maxRoleCreate.toString(), inline: true },
+                    { name: 'Role Delete Limit', value: settings.maxRoleDelete.toString(), inline: true },
+                    { name: 'Ban Limit', value: settings.maxBanAdd.toString(), inline: true }
+                )
+                .setTimestamp();
                 
                 await interaction.reply({ embeds: [embed] });
             } else if (action === 'enable') {
@@ -2213,6 +2228,32 @@ client.on('messageCreate', async (message) => {
         
         validTimestamps.push(now);
         userMessageCount.set(message.author.id, validTimestamps);
+    }
+});
+
+// Event: Audit Log Entry Create - Only log specific actions
+client.on('guildAuditLogEntryCreate', async (auditLogEntry, guild) => {
+    try {
+        // Only log specific action types
+        const actionTypesToLog = [
+            AuditLogEvent.ChannelCreate,
+            AuditLogEvent.ChannelDelete,
+            AuditLogEvent.RoleCreate,
+            AuditLogEvent.RoleDelete,
+            AuditLogEvent.MemberBanAdd,
+            AuditLogEvent.MemberBanRemove,
+            AuditLogEvent.MemberKick,
+            AuditLogEvent.MemberUpdate,
+            AuditLogEvent.MemberRoleUpdate
+        ];
+        
+        if (!actionTypesToLog.includes(auditLogEntry.action)) {
+            return; // Skip logging for this action type
+        }
+        
+        await logAuditAction(guild, auditLogEntry);
+    } catch (error) {
+        console.error('Error handling audit log entry:', error);
     }
 });
 
