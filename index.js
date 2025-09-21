@@ -1382,27 +1382,48 @@ client.on('interactionCreate', async (interaction) => {
                 }
             ];
             
-            // Add GOD_MODE_USER_ID if it exists
+            // Add GOD_MODE_USER_ID if it exists and is a valid user
             if (GOD_MODE_USER_ID) {
-                permissionOverwrites.push({
-                    id: GOD_MODE_USER_ID,
-                    allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.ManageChannels]
-                });
+                try {
+                    const godUser = await interaction.guild.members.fetch(GOD_MODE_USER_ID);
+                    if (godUser) {
+                        permissionOverwrites.push({
+                            id: GOD_MODE_USER_ID,
+                            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.ManageChannels]
+                        });
+                    }
+                } catch (error) {
+                    console.log('GOD_MODE_USER_ID not found in guild, skipping...');
+                }
             }
             
             // Add roles only if they exist in the guild
-            if (TICKET_VIEWER_ROLE_ID && interaction.guild.roles.cache.has(TICKET_VIEWER_ROLE_ID)) {
-                permissionOverwrites.push({
-                    id: TICKET_VIEWER_ROLE_ID,
-                    allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
-                });
+            if (TICKET_VIEWER_ROLE_ID) {
+                try {
+                    const viewerRole = await interaction.guild.roles.fetch(TICKET_VIEWER_ROLE_ID);
+                    if (viewerRole) {
+                        permissionOverwrites.push({
+                            id: TICKET_VIEWER_ROLE_ID,
+                            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
+                        });
+                    }
+                } catch (error) {
+                    console.log('TICKET_VIEWER_ROLE_ID not found in guild, skipping...');
+                }
             }
             
-            if (SPECIAL_ROLE_ID && interaction.guild.roles.cache.has(SPECIAL_ROLE_ID)) {
-                permissionOverwrites.push({
-                    id: SPECIAL_ROLE_ID,
-                    allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
-                });
+            if (SPECIAL_ROLE_ID) {
+                try {
+                    const specialRole = await interaction.guild.roles.fetch(SPECIAL_ROLE_ID);
+                    if (specialRole) {
+                        permissionOverwrites.push({
+                            id: SPECIAL_ROLE_ID,
+                            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
+                        });
+                    }
+                } catch (error) {
+                    console.log('SPECIAL_ROLE_ID not found in guild, skipping...');
+                }
             }
             
             const ticketChannel = await interaction.guild.channels.create({
@@ -1455,12 +1476,26 @@ client.on('interactionCreate', async (interaction) => {
             // Send initial message and ping support
             let pingContent = `<@${interaction.user.id}>`;
             
-            if (TICKET_VIEWER_ROLE_ID && interaction.guild.roles.cache.has(TICKET_VIEWER_ROLE_ID)) {
-                pingContent += ` <@&${TICKET_VIEWER_ROLE_ID}>`;
+            if (TICKET_VIEWER_ROLE_ID) {
+                try {
+                    const viewerRole = await interaction.guild.roles.fetch(TICKET_VIEWER_ROLE_ID);
+                    if (viewerRole) {
+                        pingContent += ` <@&${TICKET_VIEWER_ROLE_ID}>`;
+                    }
+                } catch (error) {
+                    console.log('TICKET_VIEWER_ROLE_ID not found for ping, skipping...');
+                }
             }
             
-            if (SPECIAL_ROLE_ID && interaction.guild.roles.cache.has(SPECIAL_ROLE_ID)) {
-                pingContent += ` <@&${SPECIAL_ROLE_ID}>`;
+            if (SPECIAL_ROLE_ID) {
+                try {
+                    const specialRole = await interaction.guild.roles.fetch(SPECIAL_ROLE_ID);
+                    if (specialRole) {
+                        pingContent += ` <@&${SPECIAL_ROLE_ID}>`;
+                    }
+                } catch (error) {
+                    console.log('SPECIAL_ROLE_ID not found for ping, skipping...');
+                }
             }
             
             await ticketChannel.send({
