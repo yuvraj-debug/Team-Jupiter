@@ -129,16 +129,6 @@ const ticketsSchema = new mongoose.Schema({
 });
 const Tickets = mongoose.model('Tickets', ticketsSchema);
 
-// Immune Users Schema
-const immuneSchema = new mongoose.Schema({
-    userId: { type: String, required: true, unique: true },
-    addedBy: { type: String, required: true },
-    reason: String,
-    timestamp: { type: Date, default: Date.now },
-    expiresAt: Date
-});
-const Immune = mongoose.model('Immune', immuneSchema);
-
 // Security Log Schema
 const securityLogSchema = new mongoose.Schema({
     guildId: { type: String, required: true },
@@ -234,19 +224,6 @@ async function isWhitelisted(userId) {
     return await Whitelist.exists({ userId: userId });
 }
 
-async function isImmune(userId) {
-    const immune = await Immune.findOne({ userId: userId });
-    if (!immune) return false;
-    
-    // Check if immunity has expired
-    if (immune.expiresAt && immune.expiresAt < new Date()) {
-        await Immune.deleteOne({ userId: userId });
-        return false;
-    }
-    
-    return true;
-}
-
 async function getGuildSettings(guildId) {
     let settings = await GuildSettings.findOne({ guildId: guildId });
     if (!settings) {
@@ -328,16 +305,16 @@ async function backupServerState(guild, backupName = 'Manual Backup') {
                 permissionOverwrites: channel.permissionOverwrites.cache.map(overwrite => ({
                     id: overwrite.id,
                     type: overwrite.type,
-                    allow: overwrite.allow.bitfield.toString(),
-                    deny: overwrite.deny.bitfield.toString()
+                    allow: overwrite.allow ? overwrite.allow.bitfield.toString() : '0',
+                    deny: overwrite.deny ? overwrite.deny.bitfield.toString() : '0'
                 })),
-                topic: channel.topic,
-                nsfw: channel.nsfw,
-                rateLimitPerUser: channel.rateLimitPerUser,
-                bitrate: channel.bitrate,
-                userLimit: channel.userLimit,
-                rtcRegion: channel.rtcRegion,
-                videoQualityMode: channel.videoQualityMode
+                topic: channel.topic || '',
+                nsfw: channel.nsfw || false,
+                rateLimitPerUser: channel.rateLimitPerUser || 0,
+                bitrate: channel.bitrate || 0,
+                userLimit: channel.userLimit || 0,
+                rtcRegion: channel.rtcRegion || '',
+                videoQualityMode: channel.videoQualityMode || 0
             });
         });
 
@@ -352,8 +329,8 @@ async function backupServerState(guild, backupName = 'Manual Backup') {
                 position: role.position,
                 permissions: role.permissions.bitfield.toString(),
                 mentionable: role.mentionable,
-                icon: role.icon,
-                unicodeEmoji: role.unicodeEmoji
+                icon: role.icon || '',
+                unicodeEmoji: role.unicodeEmoji || ''
             });
         });
 
@@ -626,8 +603,8 @@ async function monitorAuditLogs(guild) {
         const auditLogs = await guild.fetchAuditLogs({ limit: 10 });
         
         for (const entry of auditLogs.entries.values()) {
-            // Skip if user is whitelisted or immune
-            if (await isWhitelisted(entry.executor.id) || await isImmune(entry.executor.id)) continue;
+            // Skip if user is whitelisted
+            if (await isWhitelisted(entry.executor.id)) continue;
             
             const now = Date.now();
             const actionType = entry.action;
@@ -635,6 +612,9 @@ async function monitorAuditLogs(guild) {
             
             // Skip if executor is a bot (unless it's our bot)
             if (entry.executor.bot && entry.executor.id !== client.user.id) continue;
+            
+            // Enhanced audit log logging with better UI
+            await logAuditAction(guild, entry);
             
             // Track different types of actions
             if ([AuditLogEvent.ChannelCreate, AuditLogEvent.ChannelDelete, 
@@ -742,6 +722,106 @@ async function monitorAuditLogs(guild) {
     }
 }
 
+// Enhanced audit log logging with better UI
+async function logAuditAction(guild, entry) {
+    try {
+        const settings = await getGuildSettings(guild.id);
+        const logChannelId = settings.logChannelId;
+        if (!logChannelId) return;
+
+        const logChannel = guild.channels.cache.get(logChannelId);
+        if (!logChannel) return;
+
+        let actionType = '';
+        let color = 0x3498DB;
+        let emoji = '📝';
+        let targetInfo = '';
+
+        switch (entry.action) {
+            case AuditLogEvent.ChannelCreate:
+                actionType = 'Channel Created';
+                color = 0x00FF00;
+                emoji = '🔧';
+                targetInfo = `**Name:** ${entry.target.name}\n**Type:** ${ChannelType[entry.target.type]}`;
+                break;
+            case AuditLogEvent.ChannelDelete:
+                actionType = 'Channel Deleted';
+                color = 0xFF0000;
+                emoji = '🗑️';
+                targetInfo = `**Name:** ${entry.target.name}\n**Type:** ${ChannelType[entry.target.type]}`;
+                break;
+            case AuditLogEvent.ChannelUpdate:
+                actionType = 'Channel Updated';
+                color = 0xFFFF00;
+                emoji = '✏️';
+                targetInfo = `**Channel:** ${entry.target}`;
+                break;
+            case AuditLogEvent.RoleCreate:
+                actionType = 'Role Created';
+                color = 0x00FF00;
+                emoji = '🔧';
+                targetInfo = `**Name:** ${entry.target.name}`;
+                break;
+            case AuditLogEvent.RoleDelete:
+                actionType = 'Role Deleted';
+                color = 0xFF0000;
+                emoji = '🗑️';
+                targetInfo = `**Name:** ${entry.target.name}`;
+                break;
+            case AuditLogEvent.RoleUpdate:
+                actionType = 'Role Updated';
+                color = 0xFFFF00;
+                emoji = '✏️';
+                targetInfo = `**Role:** ${entry.target}`;
+                break;
+            case AuditLogEvent.MemberBanAdd:
+                actionType = 'Member Banned';
+                color = 0xFF0000;
+                emoji = '🔨';
+                targetInfo = `**User:** <@${entry.target.id}>\n**ID:** ${entry.target.id}`;
+                break;
+            case AuditLogEvent.MemberBanRemove:
+                actionType = 'Member Unbanned';
+                color = 0x00FF00;
+                emoji = '✅';
+                targetInfo = `**User:** <@${entry.target.id}>\n**ID:** ${entry.target.id}`;
+                break;
+            case AuditLogEvent.MemberKick:
+                actionType = 'Member Kicked';
+                color = 0xFFA500;
+                emoji = '👢';
+                targetInfo = `**User:** <@${entry.target.id}>\n**ID:** ${entry.target.id}`;
+                break;
+            case AuditLogEvent.MemberUpdate:
+                actionType = 'Member Updated';
+                color = 0xFFFF00;
+                emoji = '👤';
+                targetInfo = `**User:** <@${entry.target.id}>\n**ID:** ${entry.target.id}`;
+                break;
+            case AuditLogEvent.MessageDelete:
+                actionType = 'Message Deleted';
+                color = 0xFF0000;
+                emoji = '🗑️';
+                targetInfo = `**Channel:** <#${entry.extra.channel.id}>\n**Count:** ${entry.extra.count}`;
+                break;
+            default:
+                actionType = 'Unknown Action';
+                break;
+        }
+
+        const embed = new EmbedBuilder()
+            .setTitle(`${emoji} ${actionType}`)
+            .setColor(color)
+            .setDescription(`**Executor:** <@${entry.executor.id}>\n**Reason:** ${entry.reason || 'No reason provided'}\n\n${targetInfo}`)
+            .setTimestamp(entry.createdAt)
+            .setFooter({ text: `Action Type: ${entry.action} | ID: ${entry.id}`, iconURL: entry.executor.displayAvatarURL() });
+
+        await logChannel.send({ embeds: [embed] });
+    } catch (error) {
+        console.error('Error logging audit action:', error);
+    }
+}
+
 // Event: Ready
 client.once(Events.ClientReady, async () => {
     console.log(`Logged in as ${client.user.tag}!`);
@@ -755,20 +835,6 @@ client.once(Events.ClientReady, async () => {
             monitorAuditLogs(guild);
         });
     }, 3000); // Check every 3 seconds
-    
-    // Clean up expired immunity records
-    setInterval(async () => {
-        try {
-            const result = await Immune.deleteMany({ 
-                expiresAt: { $lt: new Date() } 
-            });
-            if (result.deletedCount > 0) {
-                console.log(`Cleaned up ${result.deletedCount} expired immunity records`);
-            }
-        } catch (error) {
-            console.error('Error cleaning up expired immunity records:', error);
-        }
-    }, 3600000); // Run every hour
 });
 
 // Event: Guild Member Add (Welcome System)
@@ -1187,15 +1253,6 @@ client.on('interactionCreate', async (interaction) => {
                 return;
             }
             
-            // Check if user is immune to warnings
-            if (await isImmune(user.id)) {
-                await interaction.reply({ 
-                    content: `❌ <@${user.id}> is immune to warnings.`, 
-                    ephemeral: true 
-                });
-                return;
-            }
-            
             // Get current warnings for the user
             const warnings = await Warnings.find({ 
                 userId: user.id, 
@@ -1329,7 +1386,6 @@ client.on('interactionCreate', async (interaction) => {
             // Get counts for various security metrics
             const whitelistCount = await Whitelist.countDocuments();
             const warningCount = await Warnings.countDocuments({ guildId: interaction.guild.id });
-            const immuneCount = await Immune.countDocuments();
             const securityLogCount = await SecurityLog.countDocuments({ guildId: interaction.guild.id });
             
             const settings = await getGuildSettings(interaction.guild.id);
@@ -1345,7 +1401,6 @@ client.on('interactionCreate', async (interaction) => {
                     { name: 'Rate Limiting', value: '✅ Active', inline: true },
                     { name: 'Whitelisted Users', value: whitelistCount.toString(), inline: true },
                     { name: 'Total Warnings', value: warningCount.toString(), inline: true },
-                    { name: 'Immune Users', value: immuneCount.toString(), inline: true },
                     { name: 'Security Logs', value: securityLogCount.toString(), inline: true },
                     { name: 'Lockdown Mode', value: settings.lockdownMode ? '🔒 Active' : '🔓 Inactive', inline: true },
                     { name: 'Ticket System', value: settings.ticketChannelId ? '✅ Active' : '❌ Not Setup', inline: true },
@@ -1399,6 +1454,25 @@ client.on('interactionCreate', async (interaction) => {
                 
                 await interaction.reply({ embeds: [embed] });
             }
+        }
+        
+        else if (interaction.commandName === 'free') {
+            // Free command to clear lockdown
+            const unlockedCount = await unlockServer(interaction.guild, interaction.user.tag);
+            
+            // Response
+            const embed = new EmbedBuilder()
+                .setTitle('🔓 Server Lockdown Cleared')
+                .setColor(0x00FF00)
+                .setDescription(`The server lockdown has been lifted.`)
+                .setThumbnail(interaction.guild.iconURL())
+                .addFields(
+                    { name: 'Channels Unlocked', value: unlockedCount.toString(), inline: true },
+                    { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true }
+                )
+                .setTimestamp();
+            
+            await interaction.reply({ embeds: [embed] });
         }
         
         else if (interaction.commandName === 'anti_nuke') {
@@ -1509,6 +1583,8 @@ client.on('interactionCreate', async (interaction) => {
             const backupName = interaction.options.getString('name') || 'Manual Backup';
             
             try {
+                await interaction.deferReply();
+                
                 const backup = await backupServerState(interaction.guild, backupName);
                 
                 const embed = new EmbedBuilder()
@@ -1526,7 +1602,7 @@ client.on('interactionCreate', async (interaction) => {
                     )
                     .setTimestamp();
                 
-                await interaction.reply({ embeds: [embed] });
+                await interaction.editReply({ embeds: [embed] });
                 
                 await logAction(
                     interaction.guild,
@@ -1544,9 +1620,8 @@ client.on('interactionCreate', async (interaction) => {
                 );
             } catch (error) {
                 console.error('Error creating backup:', error);
-                await interaction.reply({ 
-                    content: '❌ An error occurred while creating the backup.', 
-                    ephemeral: true 
+                await interaction.editReply({ 
+                    content: `❌ An error occurred while creating the backup: ${error.message}` 
                 });
             }
         }
@@ -1633,144 +1708,6 @@ client.on('interactionCreate', async (interaction) => {
                     content: '❌ An error occurred while listing backups.', 
                     ephemeral: true 
                 });
-            }
-        }
-        
-        else if (interaction.commandName === 'immune') {
-            const action = interaction.options.getString('action');
-            const user = interaction.options.getUser('user');
-            
-            if (action === 'add') {
-                const reason = interaction.options.getString('reason') || 'No reason provided';
-                const duration = interaction.options.getString('duration');
-                
-                // Check if already immune
-                const existing = await Immune.findOne({ userId: user.id });
-                if (existing) {
-                    await interaction.reply({ 
-                        content: `❌ <@${user.id}> is already immune.`, 
-                        ephemeral: true 
-                    });
-                    return;
-                }
-                
-                // Calculate expiration date if duration is provided
-                let expiresAt = null;
-                if (duration) {
-                    const now = new Date();
-                    if (duration.endsWith('d')) {
-                        const days = parseInt(duration);
-                        expiresAt = new Date(now.setDate(now.getDate() + days));
-                    } else if (duration.endsWith('h')) {
-                        const hours = parseInt(duration);
-                        expiresAt = new Date(now.setHours(now.getHours() + hours));
-                    }
-                }
-                
-                // Add to immune list
-                const immuneEntry = new Immune({
-                    userId: user.id,
-                    addedBy: interaction.user.id,
-                    reason: reason,
-                    expiresAt: expiresAt
-                });
-                await immuneEntry.save();
-                
-                // Success response
-                const embed = new EmbedBuilder()
-                    .setTitle('✅ User Immunity Granted')
-                    .setColor(0x00FF00)
-                    .setThumbnail(user.displayAvatarURL())
-                    .addFields(
-                        { name: 'User', value: `<@${user.id}> (${user.id})`, inline: true },
-                        { name: 'Added By', value: `<@${interaction.user.id}>`, inline: true },
-                        { name: 'Reason', value: reason, inline: false },
-                        { name: 'Expires', value: expiresAt ? `<t:${Math.floor(expiresAt.getTime() / 1000)}:R>` : 'Never', inline: true }
-                    )
-                    .setTimestamp();
-                
-                await interaction.reply({ embeds: [embed] });
-                
-                // Log the action
-                await logAction(
-                    interaction.guild,
-                    'HIGH',
-                    '🛡️ User Immunity Granted',
-                    `<@${user.id}> has been granted immunity.`,
-                    [
-                        { name: 'User', value: `<@${user.id}> (${user.id})`, inline: true },
-                        { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true },
-                        { name: 'Reason', value: reason, inline: false },
-                        { name: 'Expires', value: expiresAt ? `<t:${Math.floor(expiresAt.getTime() / 1000)}:R>` : 'Never', inline: true }
-                    ]
-                );
-            } else if (action === 'remove') {
-                // Check if user is immune
-                const existing = await Immune.findOne({ userId: user.id });
-                if (!existing) {
-                    await interaction.reply({ 
-                        content: `❌ <@${user.id}> is not immune.`, 
-                        ephemeral: true 
-                    });
-                    return;
-                }
-                
-                // Remove from immune list
-                await Immune.deleteOne({ userId: user.id });
-                
-                // Success response
-                const embed = new EmbedBuilder()
-                    .setTitle('❌ User Immunity Revoked')
-                    .setColor(0xFF0000)
-                    .setThumbnail(user.displayAvatarURL())
-                    .addFields(
-                        { name: 'User', value: `<@${user.id}> (${user.id})`, inline: true },
-                        { name: 'Removed By', value: `<@${interaction.user.id}>`, inline: true },
-                        { name: 'Timestamp', value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: true }
-                    )
-                    .setTimestamp();
-                
-                await interaction.reply({ embeds: [embed] });
-                
-                // Log the action
-                await logAction(
-                    interaction.guild,
-                    'HIGH',
-                    '🛡️ User Immunity Revoked',
-                    `<@${user.id}> has been removed from the immune list.`,
-                    [
-                        { name: 'User', value: `<@${user.id}> (${user.id})`, inline: true },
-                        { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true }
-                    ]
-                );
-            } else if (action === 'list') {
-                const immuneUsers = await Immune.find({});
-                
-                if (immuneUsers.length === 0) {
-                    await interaction.reply({ 
-                        content: '❌ No users have immunity.', 
-                        ephemeral: true 
-                    });
-                    return;
-                }
-                
-                const embed = new EmbedBuilder()
-                    .setTitle('🛡️ Immune Users')
-                    .setColor(0x0099FF)
-                    .setThumbnail(interaction.guild.iconURL());
-                
-                immuneUsers.forEach(immune => {
-                    const user = client.users.cache.get(immune.userId);
-                    embed.addFields({
-                        name: user ? user.tag : immune.userId,
-                        value: `**Added by:** <@${immune.addedBy}>\n**Reason:** ${immune.reason || 'No reason provided'}\n**Expires:** ${immune.expiresAt ? `<t:${Math.floor(immune.expiresAt.getTime() / 1000)}:R>` : 'Never'}`,
-                        inline: false
-                    });
-                });
-                
-                embed.setFooter({ text: `Total Immune Users: ${immuneUsers.length}` });
-                
-                await interaction.reply({ embeds: [embed] });
             }
         }
     } catch (error) {
@@ -2431,6 +2368,10 @@ client.on(Events.ClientReady, async () => {
                 ]
             },
             {
+                name: 'free',
+                description: 'Clear server lockdown'
+            },
+            {
                 name: 'anti_nuke',
                 description: 'Configure anti-nuke settings',
                 options: [
@@ -2494,41 +2435,6 @@ client.on(Events.ClientReady, async () => {
             {
                 name: 'list_backups',
                 description: 'List all server backups'
-            },
-            {
-                name: 'immune',
-                description: 'Manage immune users',
-                options: [
-                    {
-                        name: 'action',
-                        type: 3, // STRING
-                        description: 'The action to perform',
-                        required: true,
-                        choices: [
-                            { name: 'Add', value: 'add' },
-                            { name: 'Remove', value: 'remove' },
-                            { name: 'List', value: 'list' }
-                        ]
-                    },
-                    {
-                        name: 'user',
-                        type: 6, // USER
-                        description: 'The user to manage',
-                        required: false
-                    },
-                    {
-                        name: 'reason',
-                        type: 3, // STRING
-                        description: 'Reason for immunity',
-                        required: false
-                    },
-                    {
-                        name: 'duration',
-                        type: 3, // STRING
-                        description: 'Duration of immunity (e.g., 7d, 24h)',
-                        required: false
-                    }
-                ]
             }
         ]);
         
