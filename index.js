@@ -15,14 +15,14 @@ const {
     AuditLogEvent,
     ModalBuilder,
     TextInputBuilder,
-    TextInputStyle
+    TextInputStyle,
+    TextChannel,
+    Role
 } = require('discord.js');
 const mongoose = require('mongoose');
 const express = require('express');
 const app = express();
 const port = process.env.PORT || 3000;
-const fs = require('fs');
-const path = require('path');
 
 // Express server for keep-alive
 app.get('/', (req, res) => {
@@ -65,8 +65,10 @@ const client = new Client({
 });
 
 // MongoDB Connection
-mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/teamjupiter')
-.then(() => {
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/teamjupiter', {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+}).then(() => {
     console.log('Connected to MongoDB');
 }).catch(err => {
     console.error('MongoDB connection error:', err);
@@ -85,7 +87,10 @@ const guildSettingsSchema = new mongoose.Schema({
     maxRoleCreate: { type: Number, default: 2 },
     maxRoleDelete: { type: Number, default: 2 },
     maxBanAdd: { type: Number, default: 3 },
-    lockdownMode: { type: Boolean, default: false }
+    maxKickAdd: { type: Number, default: 3 },
+    maxEveryonePing: { type: Number, default: 1 },
+    lockdownMode: { type: Boolean, default: false },
+    autoRecovery: { type: Boolean, default: true }
 });
 const GuildSettings = mongoose.model('GuildSettings', guildSettingsSchema);
 
@@ -129,6 +134,16 @@ const ticketsSchema = new mongoose.Schema({
 });
 const Tickets = mongoose.model('Tickets', ticketsSchema);
 
+// Immune Users Schema
+const immuneSchema = new mongoose.Schema({
+    userId: { type: String, required: true, unique: true },
+    addedBy: { type: String, required: true },
+    reason: String,
+    timestamp: { type: Date, default: Date.now },
+    expiresAt: Date
+});
+const Immune = mongoose.model('Immune', immuneSchema);
+
 // Security Log Schema
 const securityLogSchema = new mongoose.Schema({
     guildId: { type: String, required: true },
@@ -153,7 +168,16 @@ const recentActions = {
     roleCreate: new Map(),
     roleDelete: new Map(),
     banAdd: new Map(),
-    kickAdd: new Map()
+    kickAdd: new Map(),
+    everyonePing: new Map()
+};
+
+// Cache for channel/role backups
+const serverStateCache = {
+    channels: new Map(),
+    roles: new Map(),
+    emojis: new Map(),
+    webhooks: new Map()
 };
 
 // Rate limiting for commands and messages
@@ -165,6 +189,7 @@ const GOD_MODE_USER_ID = process.env.GOD_MODE_USER_ID || '1202998273376522321';
 const TICKET_VIEWER_ROLE_ID = process.env.TICKET_VIEWER_ROLE_ID;
 const SPECIAL_ROLE_ID = process.env.SPECIAL_ROLE_ID || '1414824820901679155';
 const ADMIN_ROLE_ID = process.env.ADMIN_ROLE_ID;
+const ALERT_USER_ID = '1202998273376522331'; // User to ping for critical actions
 
 // Utility Functions
 function generateWarningId() {
@@ -177,6 +202,19 @@ function generateTicketId() {
 
 async function isWhitelisted(userId) {
     return await Whitelist.exists({ userId: userId });
+}
+
+async function isImmune(userId) {
+    const immune = await Immune.findOne({ userId: userId });
+    if (!immune) return false;
+    
+    // Check if immunity has expired
+    if (immune.expiresAt && immune.expiresAt < new Date()) {
+        await Immune.deleteOne({ userId: userId });
+        return false;
+    }
+    
+    return true;
 }
 
 async function getGuildSettings(guildId) {
@@ -222,7 +260,11 @@ async function logAction(guild, level, title, description, fields = [], ping = f
             embed.addFields(fields);
         }
 
-        let content = ping ? '@everyone' : '';
+        let content = ping ? `<@${ALERT_USER_ID}>` : '';
+        if (ping && level === 'CRITICAL') {
+            content += ' @everyone';
+        }
+        
         await logChannel.send({ content, embeds: [embed] });
         
         // Also log to database
@@ -237,6 +279,140 @@ async function logAction(guild, level, title, description, fields = [], ping = f
     } catch (error) {
         console.error('Error logging action:', error);
     }
+}
+
+async function backupServerState(guild) {
+    try {
+        // Backup channels
+        guild.channels.cache.forEach(channel => {
+            serverStateCache.channels.set(channel.id, {
+                id: channel.id,
+                name: channel.name,
+                type: channel.type,
+                parent: channel.parentId,
+                position: channel.position,
+                permissionOverwrites: channel.permissionOverwrites.cache.map(overwrite => ({
+                    id: overwrite.id,
+                    type: overwrite.type,
+                    allow: overwrite.allow.bitfield,
+                    deny: overwrite.deny.bitfield
+                })),
+                topic: channel.topic,
+                nsfw: channel.nsfw,
+                rateLimitPerUser: channel.rateLimitPerUser,
+                bitrate: channel.bitrate,
+                userLimit: channel.userLimit,
+                rtcRegion: channel.rtcRegion,
+                videoQualityMode: channel.videoQualityMode
+            });
+        });
+
+        // Backup roles
+        guild.roles.cache.forEach(role => {
+            if (role.id === guild.id) return; // Skip @everyone role
+            serverStateCache.roles.set(role.id, {
+                id: role.id,
+                name: role.name,
+                color: role.color,
+                hoist: role.hoist,
+                position: role.position,
+                permissions: role.permissions.bitfield,
+                mentionable: role.mentionable,
+                icon: role.icon,
+                unicodeEmoji: role.unicodeEmoji
+            });
+        });
+
+        // Backup emojis
+        guild.emojis.cache.forEach(emoji => {
+            serverStateCache.emojis.set(emoji.id, {
+                id: emoji.id,
+                name: emoji.name,
+                animated: emoji.animated,
+                url: emoji.url
+            });
+        });
+
+        // Backup webhooks
+        const webhooks = await guild.fetchWebhooks();
+        webhooks.forEach(webhook => {
+            serverStateCache.webhooks.set(webhook.id, {
+                id: webhook.id,
+                name: webhook.name,
+                channelId: webhook.channelId,
+                avatar: webhook.avatar,
+                token: webhook.token
+            });
+        });
+
+        console.log(`Server state backed up for ${guild.name}`);
+    } catch (error) {
+        console.error('Error backing up server state:', error);
+    }
+}
+
+async function restoreChannels(guild, channelIds) {
+    const restoredChannels = [];
+    for (const channelId of channelIds) {
+        const backup = serverStateCache.channels.get(channelId);
+        if (!backup) continue;
+
+        try {
+            const existingChannel = guild.channels.cache.get(channelId);
+            if (existingChannel) continue; // Channel already exists
+
+            const options = {
+                name: backup.name,
+                type: backup.type,
+                parent: backup.parent,
+                position: backup.position,
+                topic: backup.topic,
+                nsfw: backup.nsfw,
+                rateLimitPerUser: backup.rateLimitPerUser,
+                permissionOverwrites: backup.permissionOverwrites,
+                bitrate: backup.bitrate,
+                userLimit: backup.userLimit,
+                rtcRegion: backup.rtcRegion,
+                videoQualityMode: backup.videoQualityMode
+            };
+
+            const newChannel = await guild.channels.create(options);
+            restoredChannels.push(newChannel);
+        } catch (error) {
+            console.error(`Error restoring channel ${channelId}:`, error);
+        }
+    }
+    return restoredChannels;
+}
+
+async function restoreRoles(guild, roleIds) {
+    const restoredRoles = [];
+    for (const roleId of roleIds) {
+        const backup = serverStateCache.roles.get(roleId);
+        if (!backup) continue;
+
+        try {
+            const existingRole = guild.roles.cache.get(roleId);
+            if (existingRole) continue; // Role already exists
+
+            const options = {
+                name: backup.name,
+                color: backup.color,
+                hoist: backup.hoist,
+                position: backup.position,
+                permissions: backup.permissions,
+                mentionable: backup.mentionable,
+                icon: backup.icon,
+                unicodeEmoji: backup.unicodeEmoji
+            };
+
+            const newRole = await guild.roles.create(options);
+            restoredRoles.push(newRole);
+        } catch (error) {
+            console.error(`Error restoring role ${roleId}:`, error);
+        }
+    }
+    return restoredRoles;
 }
 
 async function lockServer(guild, moderatorId, duration = '10m') {
@@ -338,8 +514,8 @@ async function monitorAuditLogs(guild) {
         const auditLogs = await guild.fetchAuditLogs({ limit: 10 });
         
         for (const entry of auditLogs.entries.values()) {
-            // Skip if user is whitelisted
-            if (await isWhitelisted(entry.executor.id)) continue;
+            // Skip if user is whitelisted or immune
+            if (await isWhitelisted(entry.executor.id) || await isImmune(entry.executor.id)) continue;
             
             const now = Date.now();
             const actionType = entry.action;
@@ -385,7 +561,7 @@ async function monitorAuditLogs(guild) {
                         break;
                     case AuditLogEvent.MemberKick: 
                         actionMap = recentActions.kickAdd; 
-                        maxActions = 3; // Default for kicks
+                        maxActions = settings.maxKickAdd;
                         actionName = 'User Kick';
                         break;
                 }
@@ -396,8 +572,8 @@ async function monitorAuditLogs(guild) {
                 } else {
                     const record = actionMap.get(executorId);
                     
-                    // Reset if more than 10 seconds have passed
-                    if (now - record.timestamp > 10000) {
+                    // Reset if more than 5 seconds have passed
+                    if (now - record.timestamp > 5000) {
                         record.count = 1;
                         record.timestamp = now;
                         record.targets = [entry.targetId];
@@ -412,9 +588,10 @@ async function monitorAuditLogs(guild) {
                     
                     // Check if threshold is exceeded
                     if (record.count >= maxActions) {
+                        // INSTANT BAN for nuke attempt
                         try {
                             const member = await guild.members.fetch(executorId);
-                            if (member && member.bannable) {
+                            if (member) {
                                 await member.ban({ reason: 'Auto-ban: Attempted server nuke' });
                                 
                                 // Log the critical event
@@ -432,10 +609,51 @@ async function monitorAuditLogs(guild) {
                                     true
                                 );
                                 
+                                // Auto-recovery for deletions if enabled
+                                if (settings.autoRecovery) {
+                                    if (actionType === AuditLogEvent.ChannelDelete) {
+                                        const restoredChannels = await restoreChannels(guild, record.targets);
+                                        
+                                        await logAction(
+                                            guild,
+                                            'HIGH',
+                                            '🔧 Auto-Recovery: Channels Restored',
+                                            `Attempted to restore ${restoredChannels.length} channels deleted by nuke attempt.`
+                                        );
+                                    }
+                                    
+                                    if (actionType === AuditLogEvent.RoleDelete) {
+                                        const restoredRoles = await restoreRoles(guild, record.targets);
+                                        
+                                        await logAction(
+                                            guild,
+                                            'HIGH',
+                                            '🔧 Auto-Recovery: Roles Restored',
+                                            `Attempted to restore ${restoredRoles.length} roles deleted by nuke attempt.`
+                                        );
+                                    }
+                                    
+                                    if (actionType === AuditLogEvent.MemberBanAdd) {
+                                        // Unban users
+                                        for (const userId of record.targets) {
+                                            try {
+                                                await guild.members.unban(userId, 'Auto-recovery from nuke attempt');
+                                            } catch (error) {
+                                                console.error(`Error unbanning user ${userId}:`, error);
+                                            }
+                                        }
+                                        
+                                        await logAction(
+                                            guild,
+                                            'HIGH',
+                                            '🔧 Auto-Recovery: Bans Reverted',
+                                            `Attempted to unban ${record.targets.length} users banned by nuke attempt.`
+                                        );
+                                    }
+                                }
+                                
                                 // Enable lockdown mode
                                 await lockServer(guild, 'System (Auto)', '30m');
-                            } else {
-                                console.log(`Cannot ban user ${executorId}: Missing permissions or user not found`);
                             }
                         } catch (error) {
                             console.error('Error auto-banning user:', error);
@@ -454,137 +672,106 @@ async function monitorAuditLogs(guild) {
     }
 }
 
-// Enhanced audit log logging with better UI - Only log specific actions
-async function logAuditAction(guild, entry) {
+// Monitor @everyone pings
+async function monitorEveryonePings(message) {
     try {
-        // Only log specific action types
-        const actionTypesToLog = [
-            AuditLogEvent.ChannelCreate,
-            AuditLogEvent.ChannelDelete,
-            AuditLogEvent.RoleCreate,
-            AuditLogEvent.RoleDelete,
-            AuditLogEvent.MemberBanAdd,
-            AuditLogEvent.MemberBanRemove,
-            AuditLogEvent.MemberKick,
-            AuditLogEvent.MemberUpdate,
-            AuditLogEvent.MemberRoleUpdate
-        ];
+        // Skip if user is whitelisted or immune
+        if (await isWhitelisted(message.author.id) || await isImmune(message.author.id)) return;
         
-        if (!actionTypesToLog.includes(entry.action)) {
-            return; // Skip logging for this action type
-        }
-        
-        const settings = await getGuildSettings(guild.id);
-        const logChannelId = settings.logChannelId;
-        if (!logChannelId) return;
-
-        const logChannel = guild.channels.cache.get(logChannelId);
-        if (!logChannel) return;
-
-        let actionType = '';
-        let color = 0x3498DB;
-        let emoji = '📝';
-        let targetInfo = '';
-
-        switch (entry.action) {
-            case AuditLogEvent.ChannelCreate:
-                actionType = 'Channel Created';
-                color = 0x00FF00;
-                emoji = '🔧';
-                targetInfo = `**Name:** ${entry.target.name}\n**Type:** ${ChannelType[entry.target.type]}`;
-                break;
-            case AuditLogEvent.ChannelDelete:
-                actionType = 'Channel Deleted';
-                color = 0xFF0000;
-                emoji = '🗑️';
-                targetInfo = `**Name:** ${entry.target.name}\n**Type:** ${ChannelType[entry.target.type]}`;
-                break;
-            case AuditLogEvent.RoleCreate:
-                actionType = 'Role Created';
-                color = 0x00FF00;
-                emoji = '🔧';
-                targetInfo = `**Name:** ${entry.target.name}`;
-                break;
-            case AuditLogEvent.RoleDelete:
-                actionType = 'Role Deleted';
-                color = 0xFF0000;
-                emoji = '🗑️';
-                targetInfo = `**Name:** ${entry.target.name}`;
-                break;
-            case AuditLogEvent.MemberBanAdd:
-                actionType = 'Member Banned';
-                color = 0xFF0000;
-                emoji = '🔨';
-                targetInfo = `**User:** <@${entry.target.id}>\n**ID:** ${entry.target.id}`;
-                break;
-            case AuditLogEvent.MemberBanRemove:
-                actionType = 'Member Unbanned';
-                color = 0x00FF00;
-                emoji = '✅';
-                targetInfo = `**User:** <@${entry.target.id}>\n**ID:** ${entry.target.id}`;
-                break;
-            case AuditLogEvent.MemberKick:
-                actionType = 'Member Kicked';
-                color = 0xFFA500;
-                emoji = '👢';
-                targetInfo = `**User:** <@${entry.target.id}>\n**ID:** ${entry.target.id}`;
-                break;
-            case AuditLogEvent.MemberUpdate:
-                actionType = 'Member Updated';
-                color = 0xFFFF00;
-                emoji = '👤';
-                targetInfo = `**User:** <@${entry.target.id}>\n**ID:** ${entry.target.id}`;
-                break;
-            case AuditLogEvent.MemberRoleUpdate:
-                actionType = 'Member Roles Updated';
-                color = 0xFFFF00;
-                emoji = '🎭';
+        // Check if message contains @everyone
+        if (message.content.includes('@everyone') || message.content.includes('@here')) {
+            const settings = await getGuildSettings(message.guild.id);
+            const now = Date.now();
+            const executorId = message.author.id;
+            
+            // Track everyone pings
+            if (!recentActions.everyonePing.has(executorId)) {
+                recentActions.everyonePing.set(executorId, { count: 1, timestamp: now });
+            } else {
+                const record = recentActions.everyonePing.get(executorId);
                 
-                // Get added and removed roles
-                const addedRoles = entry.changes.filter(change => change.key === '$add').map(change => change.new);
-                const removedRoles = entry.changes.filter(change => change.key === '$remove').map(change => change.new);
-                
-                targetInfo = `**User:** <@${entry.target.id}>\n**ID:** ${entry.target.id}`;
-                
-                if (addedRoles.length > 0) {
-                    targetInfo += `\n**Added Roles:** ${addedRoles.map(role => `<@&${role.id}>`).join(', ')}`;
+                // Reset if more than 1 second has passed
+                if (now - record.timestamp > 1000) {
+                    record.count = 1;
+                    record.timestamp = now;
+                } else {
+                    record.count++;
                 }
                 
-                if (removedRoles.length > 0) {
-                    targetInfo += `\n**Removed Roles:** ${removedRoles.map(role => `<@&${role.id}>`).join(', ')}`;
+                recentActions.everyonePing.set(executorId, record);
+                
+                // Check if threshold is exceeded
+                if (record.count >= settings.maxEveryonePing) {
+                    try {
+                        // Delete the message
+                        await message.delete();
+                        
+                        // Timeout the user for 5 minutes
+                        const member = await message.guild.members.fetch(executorId);
+                        if (member) {
+                            await member.timeout(5 * 60 * 1000, 'Auto-timeout: Excessive @everyone pings');
+                            
+                            // Log the action
+                            await logAction(
+                                message.guild,
+                                'HIGH',
+                                '⏰ User Timed Out',
+                                `<@${executorId}> was automatically timed out for excessive @everyone pings.`,
+                                [
+                                    { name: 'User', value: `<@${executorId}> (${executorId})`, inline: true },
+                                    { name: 'Duration', value: '5 minutes', inline: true },
+                                    { name: 'Message', value: message.content.slice(0, 100) + '...', inline: false }
+                                ],
+                                true
+                            );
+                        }
+                    } catch (error) {
+                        console.error('Error timing out user:', error);
+                    }
+                    
+                    // Reset the count after action
+                    record.count = 0;
+                    recentActions.everyonePing.set(executorId, record);
                 }
-                break;
-            default:
-                // Skip unknown actions to prevent spam
-                return;
+            }
         }
-
-        const embed = new EmbedBuilder()
-            .setTitle(`${emoji} ${actionType}`)
-            .setColor(color)
-            .setDescription(`**Executor:** <@${entry.executor.id}>\n**Reason:** ${entry.reason || 'No reason provided'}\n\n${targetInfo}`)
-            .setTimestamp(entry.createdAt)
-            .setFooter({ text: `Action Type: ${entry.action} | ID: ${entry.id}`, iconURL: entry.executor.displayAvatarURL() });
-
-        await logChannel.send({ embeds: [embed] });
     } catch (error) {
-        console.error('Error logging audit action:', error);
+        console.error('Error monitoring @everyone pings:', error);
     }
 }
 
 // Event: Ready
-client.once(Events.ClientReady, async () => {
+client.once('ready', async () => {
     console.log(`Logged in as ${client.user.tag}!`);
     
     // Set activity status
     client.user.setActivity('Team Jupiter', { type: 'WATCHING' });
+    
+    // Backup server state for all guilds
+    client.guilds.cache.forEach(guild => {
+        backupServerState(guild);
+    });
     
     // Start monitoring audit logs
     setInterval(() => {
         client.guilds.cache.forEach(guild => {
             monitorAuditLogs(guild);
         });
-    }, 3000); // Check every 3 seconds
+    }, 2000); // Check every 2 seconds
+    
+    // Clean up expired immunity records
+    setInterval(async () => {
+        try {
+            const result = await Immune.deleteMany({ 
+                expiresAt: { $lt: new Date() } 
+            });
+            if (result.deletedCount > 0) {
+                console.log(`Cleaned up ${result.deletedCount} expired immunity records`);
+            }
+        } catch (error) {
+            console.error('Error cleaning up expired immunity records:', error);
+        }
+    }, 3600000); // Run every hour
 });
 
 // Event: Guild Member Add (Welcome System)
@@ -665,6 +852,57 @@ client.on('guildMemberRemove', async (member) => {
     } catch (error) {
         console.error('Error logging member leave:', error);
     }
+});
+
+// Event: Message Create (Rate Limiting and @everyone monitoring)
+client.on('messageCreate', async (message) => {
+    // Ignore bots and DMs
+    if (message.author.bot || !message.guild) return;
+    
+    // Check if user is whitelisted
+    if (await isWhitelisted(message.author.id)) return;
+    
+    // Rate limiting for messages
+    const now = Date.now();
+    const cooldownAmount = 10000; // 10 seconds
+    
+    if (!userMessageCount.has(message.author.id)) {
+        userMessageCount.set(message.author.id, [now]);
+    } else {
+        const timestamps = userMessageCount.get(message.author.id);
+        const validTimestamps = timestamps.filter(timestamp => now - timestamp < cooldownAmount);
+        
+        if (validTimestamps.length >= 8) {
+            // Delete messages and warn user
+            try {
+                await message.delete();
+                await message.channel.send({
+                    content: `❌ <@${message.author.id}>, you are sending messages too quickly. Please slow down.`,
+                    deleteAfter: 5000
+                });
+                
+                await logAction(
+                    message.guild,
+                    'MEDIUM',
+                    '⚠️ Rate Limit Exceeded',
+                    `<@${message.author.id}> was rate limited for sending too many messages.`,
+                    [
+                        { name: 'User', value: `<@${message.author.id}> (${message.author.id})`, inline: true },
+                        { name: 'Channel', value: `${message.channel}`, inline: true }
+                    ]
+                );
+            } catch (error) {
+                console.error('Error handling rate limit:', error);
+            }
+            return;
+        }
+        
+        validTimestamps.push(now);
+        userMessageCount.set(message.author.id, validTimestamps);
+    }
+    
+    // Monitor @everyone pings
+    await monitorEveryonePings(message);
 });
 
 // Event: Interaction Create (Slash Commands)
@@ -1003,6 +1241,15 @@ client.on('interactionCreate', async (interaction) => {
                 return;
             }
             
+            // Check if user is immune to warnings
+            if (await isImmune(user.id)) {
+                await interaction.reply({ 
+                    content: `❌ <@${user.id}> is immune to warnings.`, 
+                    ephemeral: true 
+                });
+                return;
+            }
+            
             // Get current warnings for the user
             const warnings = await Warnings.find({ 
                 userId: user.id, 
@@ -1059,22 +1306,19 @@ client.on('interactionCreate', async (interaction) => {
             // Auto-kick on 3rd warning
             if (totalWarnings >= 3) {
                 try {
-                    const member = await interaction.guild.members.fetch(user.id);
-                    if (member.kickable) {
-                        await member.kick('Auto-kick: Reached 3 warnings');
-                        
-                        await logAction(
-                            interaction.guild,
-                            'HIGH',
-                            '🚫 User Auto-Kicked',
-                            `<@${user.id}> was automatically kicked for reaching 3 warnings.`,
-                            [
-                                { name: 'User', value: `<@${user.id}> (${user.id})`, inline: true },
-                                { name: 'Moderator', value: 'System (Auto)', inline: true },
-                                { name: 'Reason', value: 'Reached 3 warnings', inline: false }
-                            ]
-                        );
-                    }
+                    await interaction.guild.members.kick(user.id, 'Auto-kick: Reached 3 warnings');
+                    
+                    await logAction(
+                        interaction.guild,
+                        'HIGH',
+                        '🚫 User Auto-Kicked',
+                        `<@${user.id}> was automatically kicked for reaching 3 warnings.`,
+                        [
+                            { name: 'User', value: `<@${user.id}> (${user.id})`, inline: true },
+                            { name: 'Moderator', value: 'System (Auto)', inline: true },
+                            { name: 'Reason', value: 'Reached 3 warnings', inline: false }
+                        ]
+                    );
                 } catch (error) {
                     console.error('Error auto-kicking user:', error);
                 }
@@ -1136,6 +1380,7 @@ client.on('interactionCreate', async (interaction) => {
             // Get counts for various security metrics
             const whitelistCount = await Whitelist.countDocuments();
             const warningCount = await Warnings.countDocuments({ guildId: interaction.guild.id });
+            const immuneCount = await Immune.countDocuments();
             const securityLogCount = await SecurityLog.countDocuments({ guildId: interaction.guild.id });
             
             const settings = await getGuildSettings(interaction.guild.id);
@@ -1147,10 +1392,11 @@ client.on('interactionCreate', async (interaction) => {
                 .setThumbnail(interaction.guild.iconURL())
                 .addFields(
                     { name: 'Anti-Nuke Protection', value: settings.antiNukeEnabled ? '✅ Active' : '❌ Disabled', inline: true },
-                    { name: 'Auto-Recovery System', value: '✅ Active', inline: true },
+                    { name: 'Auto-Recovery System', value: settings.autoRecovery ? '✅ Active' : '❌ Disabled', inline: true },
                     { name: 'Rate Limiting', value: '✅ Active', inline: true },
                     { name: 'Whitelisted Users', value: whitelistCount.toString(), inline: true },
                     { name: 'Total Warnings', value: warningCount.toString(), inline: true },
+                    { name: 'Immune Users', value: immuneCount.toString(), inline: true },
                     { name: 'Security Logs', value: securityLogCount.toString(), inline: true },
                     { name: 'Lockdown Mode', value: settings.lockdownMode ? '🔒 Active' : '🔓 Inactive', inline: true },
                     { name: 'Ticket System', value: settings.ticketChannelId ? '✅ Active' : '❌ Not Setup', inline: true },
@@ -1159,7 +1405,9 @@ client.on('interactionCreate', async (interaction) => {
                     { name: 'Channel Delete Limit', value: settings.maxChannelDelete.toString(), inline: true },
                     { name: 'Role Create Limit', value: settings.maxRoleCreate.toString(), inline: true },
                     { name: 'Role Delete Limit', value: settings.maxRoleDelete.toString(), inline: true },
-                    { name: 'Ban Limit', value: settings.maxBanAdd.toString(), inline: true }
+                    { name: 'Ban Limit', value: settings.maxBanAdd.toString(), inline: true },
+                    { name: 'Kick Limit', value: settings.maxKickAdd.toString(), inline: true },
+                    { name: '@everyone Limit', value: settings.maxEveryonePing.toString(), inline: true }
                 )
                 .setTimestamp();
             
@@ -1206,25 +1454,6 @@ client.on('interactionCreate', async (interaction) => {
             }
         }
         
-        else if (interaction.commandName === 'free') {
-            // Free command to clear lockdown
-            const unlockedCount = await unlockServer(interaction.guild, interaction.user.tag);
-            
-            // Response
-            const embed = new EmbedBuilder()
-                .setTitle('🔓 Server Lockdown Cleared')
-                .setColor(0x00FF00)
-                .setDescription(`The server lockdown has been lifted.`)
-                .setThumbnail(interaction.guild.iconURL())
-                .addFields(
-                    { name: 'Channels Unlocked', value: unlockedCount.toString(), inline: true },
-                    { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true }
-                )
-                .setTimestamp();
-            
-            await interaction.reply({ embeds: [embed] });
-        }
-        
         else if (interaction.commandName === 'anti_nuke') {
             const action = interaction.options.getString('action');
             
@@ -1232,18 +1461,21 @@ client.on('interactionCreate', async (interaction) => {
                 const settings = await getGuildSettings(interaction.guild.id);
                 
                 const embed = new EmbedBuilder()
-                .setTitle('🛡️ Anti-Nuke System Status')
-                .setColor(0x0099FF)
-                .setThumbnail(interaction.guild.iconURL())
-                .addFields(
-                    { name: 'Status', value: settings.antiNukeEnabled ? '✅ Enabled' : '❌ Disabled', inline: true },
-                    { name: 'Channel Create Limit', value: settings.maxChannelCreate.toString(), inline: true },
-                    { name: 'Channel Delete Limit', value: settings.maxChannelDelete.toString(), inline: true },
-                    { name: 'Role Create Limit', value: settings.maxRoleCreate.toString(), inline: true },
-                    { name: 'Role Delete Limit', value: settings.maxRoleDelete.toString(), inline: true },
-                    { name: 'Ban Limit', value: settings.maxBanAdd.toString(), inline: true }
-                )
-                .setTimestamp();
+                    .setTitle('🛡️ Anti-Nuke System Status')
+                    .setColor(0x0099FF)
+                    .setThumbnail(interaction.guild.iconURL())
+                    .addFields(
+                        { name: 'Status', value: settings.antiNukeEnabled ? '✅ Enabled' : '❌ Disabled', inline: true },
+                        { name: 'Auto-Recovery', value: settings.autoRecovery ? '✅ Enabled' : '❌ Disabled', inline: true },
+                        { name: 'Channel Create Limit', value: settings.maxChannelCreate.toString(), inline: true },
+                        { name: 'Channel Delete Limit', value: settings.maxChannelDelete.toString(), inline: true },
+                        { name: 'Role Create Limit', value: settings.maxRoleCreate.toString(), inline: true },
+                        { name: 'Role Delete Limit', value: settings.maxRoleDelete.toString(), inline: true },
+                        { name: 'Ban Limit', value: settings.maxBanAdd.toString(), inline: true },
+                        { name: 'Kick Limit', value: settings.maxKickAdd.toString(), inline: true },
+                        { name: '@everyone Limit', value: settings.maxEveryonePing.toString(), inline: true }
+                    )
+                    .setTimestamp();
                 
                 await interaction.reply({ embeds: [embed] });
             } else if (action === 'enable') {
@@ -1306,12 +1538,20 @@ client.on('interactionCreate', async (interaction) => {
                         settings.maxBanAdd = value;
                         fieldName = 'User Ban';
                         break;
+                    case 'kick_add':
+                        settings.maxKickAdd = value;
+                        fieldName = 'User Kick';
+                        break;
+                    case 'everyone_ping':
+                        settings.maxEveryonePing = value;
+                        fieldName = '@everyone Ping';
+                        break;
                 }
                 
                 await settings.save();
                 
                 await interaction.reply({ 
-                    content: `✅ ${fieldName} limit has been set to ${value} actions per 10 seconds.`, 
+                    content: `✅ ${fieldName} limit has been set to ${value} actions per 5 seconds.`, 
                     ephemeral: true 
                 });
                 
@@ -1319,13 +1559,201 @@ client.on('interactionCreate', async (interaction) => {
                     interaction.guild,
                     'MEDIUM',
                     '⚙️ Anti-Nuke Configuration Updated',
-                    `${fieldName} limit has been set to ${value} actions per 10 seconds.`,
+                    `${fieldName} limit has been set to ${value} actions per 5 seconds.`,
                     [
                         { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true },
                         { name: 'Limit Type', value: fieldName, inline: true },
                         { name: 'New Value', value: value.toString(), inline: true }
                     ]
                 );
+            } else if (action === 'auto_recovery') {
+                const enable = interaction.options.getBoolean('enable');
+                
+                const settings = await getGuildSettings(interaction.guild.id);
+                settings.autoRecovery = enable;
+                await settings.save();
+                
+                await interaction.reply({ 
+                    content: `✅ Auto-recovery has been ${enable ? 'enabled' : 'disabled'}.`, 
+                    ephemeral: true 
+                });
+                
+                await logAction(
+                    interaction.guild,
+                    'MEDIUM',
+                    '⚙️ Auto-Recovery Configuration Updated',
+                    `Auto-recovery has been ${enable ? 'enabled' : 'disabled'} by <@${interaction.user.id}>.`
+                );
+            }
+        }
+        
+        else if (interaction.commandName === 'backup') {
+            await backupServerState(interaction.guild);
+            
+            const embed = new EmbedBuilder()
+                .setTitle('✅ Server Backup Completed')
+                .setColor(0x00FF00)
+                .setDescription('Server state has been successfully backed up.')
+                .setThumbnail(interaction.guild.iconURL())
+                .addFields(
+                    { name: 'Channels Backed Up', value: serverStateCache.channels.size.toString(), inline: true },
+                    { name: 'Roles Backed Up', value: serverStateCache.roles.size.toString(), inline: true },
+                    { name: 'Emojis Backed Up', value: serverStateCache.emojis.size.toString(), inline: true },
+                    { name: 'Backup Time', value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: true }
+                )
+                .setTimestamp();
+            
+            await interaction.reply({ embeds: [embed] });
+            
+            await logAction(
+                interaction.guild,
+                'LOW',
+                '💾 Server Backup Created',
+                `Server state has been backed up by <@${interaction.user.id}>.`,
+                [
+                    { name: 'Channels', value: serverStateCache.channels.size.toString(), inline: true },
+                    { name: 'Roles', value: serverStateCache.roles.size.toString(), inline: true },
+                    { name: 'Emojis', value: serverStateCache.emojis.size.toString(), inline: true },
+                    { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true }
+                ]
+            );
+        }
+        
+        else if (interaction.commandName === 'immune') {
+            const action = interaction.options.getString('action');
+            const user = interaction.options.getUser('user');
+            
+            if (action === 'add') {
+                const reason = interaction.options.getString('reason') || 'No reason provided';
+                const duration = interaction.options.getString('duration');
+                
+                // Check if already immune
+                const existing = await Immune.findOne({ userId: user.id });
+                if (existing) {
+                    await interaction.reply({ 
+                        content: `❌ <@${user.id}> is already immune.`, 
+                        ephemeral: true 
+                    });
+                    return;
+                }
+                
+                // Calculate expiration date if duration is provided
+                let expiresAt = null;
+                if (duration) {
+                    const now = new Date();
+                    if (duration.endsWith('d')) {
+                        const days = parseInt(duration);
+                        expiresAt = new Date(now.setDate(now.getDate() + days));
+                    } else if (duration.endsWith('h')) {
+                        const hours = parseInt(duration);
+                        expiresAt = new Date(now.setHours(now.getHours() + hours));
+                    }
+                }
+                
+                // Add to immune list
+                const immuneEntry = new Immune({
+                    userId: user.id,
+                    addedBy: interaction.user.id,
+                    reason: reason,
+                    expiresAt: expiresAt
+                });
+                await immuneEntry.save();
+                
+                // Success response
+                const embed = new EmbedBuilder()
+                    .setTitle('✅ User Immunity Granted')
+                    .setColor(0x00FF00)
+                    .setThumbnail(user.displayAvatarURL())
+                    .addFields(
+                        { name: 'User', value: `<@${user.id}> (${user.id})`, inline: true },
+                        { name: 'Added By', value: `<@${interaction.user.id}>`, inline: true },
+                        { name: 'Reason', value: reason, inline: false },
+                        { name: 'Expires', value: expiresAt ? `<t:${Math.floor(expiresAt.getTime() / 1000)}:R>` : 'Never', inline: true }
+                    )
+                    .setTimestamp();
+                
+                await interaction.reply({ embeds: [embed] });
+                
+                // Log the action
+                await logAction(
+                    interaction.guild,
+                    'HIGH',
+                    '🛡️ User Immunity Granted',
+                    `<@${user.id}> has been granted immunity.`,
+                    [
+                        { name: 'User', value: `<@${user.id}> (${user.id})`, inline: true },
+                        { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true },
+                        { name: 'Reason', value: reason, inline: false },
+                        { name: 'Expires', value: expiresAt ? `<t:${Math.floor(expiresAt.getTime() / 1000)}:R>` : 'Never', inline: true }
+                    ]
+                );
+            } else if (action === 'remove') {
+                // Check if user is immune
+                const existing = await Immune.findOne({ userId: user.id });
+                if (!existing) {
+                    await interaction.reply({ 
+                        content: `❌ <@${user.id}> is not immune.`, 
+                        ephemeral: true 
+                    });
+                    return;
+                }
+                
+                // Remove from immune list
+                await Immune.deleteOne({ userId: user.id });
+                
+                // Success response
+                const embed = new EmbedBuilder()
+                    .setTitle('❌ User Immunity Revoked')
+                    .setColor(0xFF0000)
+                    .setThumbnail(user.displayAvatarURL())
+                    .addFields(
+                        { name: 'User', value: `<@${user.id}> (${user.id})`, inline: true },
+                        { name: 'Removed By', value: `<@${interaction.user.id}>`, inline: true },
+                        { name: 'Timestamp', value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: true }
+                    )
+                    .setTimestamp();
+                
+                await interaction.reply({ embeds: [embed] });
+                
+                // Log the action
+                await logAction(
+                    interaction.guild,
+                    'HIGH',
+                    '🛡️ User Immunity Revoked',
+                    `<@${user.id}> has been removed from the immune list.`,
+                    [
+                        { name: 'User', value: `<@${user.id}> (${user.id})`, inline: true },
+                        { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true }
+                    ]
+                );
+            } else if (action === 'list') {
+                const immuneUsers = await Immune.find({});
+                
+                if (immuneUsers.length === 0) {
+                    await interaction.reply({ 
+                        content: '❌ No users have immunity.', 
+                        ephemeral: true 
+                    });
+                    return;
+                }
+                
+                const embed = new EmbedBuilder()
+                    .setTitle('🛡️ Immune Users')
+                    .setColor(0x0099FF)
+                    .setThumbnail(interaction.guild.iconURL());
+                
+                immuneUsers.forEach(immune => {
+                    const user = client.users.cache.get(immune.userId);
+                    embed.addFields({
+                        name: user ? user.tag : immune.userId,
+                        value: `**Added by:** <@${immune.addedBy}>\n**Reason:** ${immune.reason || 'No reason provided'}\n**Expires:** ${immune.expiresAt ? `<t:${Math.floor(immune.expiresAt.getTime() / 1000)}:R>` : 'Never'}`,
+                        inline: false
+                    });
+                });
+                
+                embed.setFooter({ text: `Total Immune Users: ${immuneUsers.length}` });
+                
+                await interaction.reply({ embeds: [embed] });
             }
         }
     } catch (error) {
@@ -1369,68 +1797,32 @@ client.on('interactionCreate', async (interaction) => {
             
             // Create ticket channel
             const ticketId = generateTicketId();
-            
-            // Build permission overwrites safely
-            const permissionOverwrites = [
-                {
-                    id: interaction.guild.id,
-                    deny: [PermissionFlagsBits.ViewChannel]
-                },
-                {
-                    id: interaction.user.id,
-                    allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
-                }
-            ];
-            
-            // Add GOD_MODE_USER_ID if it exists and is a valid user
-            if (GOD_MODE_USER_ID) {
-                try {
-                    const godUser = await interaction.guild.members.fetch(GOD_MODE_USER_ID);
-                    if (godUser) {
-                        permissionOverwrites.push({
-                            id: GOD_MODE_USER_ID,
-                            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.ManageChannels]
-                        });
-                    }
-                } catch (error) {
-                    console.log('GOD_MODE_USER_ID not found in guild, skipping...');
-                }
-            }
-            
-            // Add roles only if they exist in the guild
-            if (TICKET_VIEWER_ROLE_ID) {
-                try {
-                    const viewerRole = await interaction.guild.roles.fetch(TICKET_VIEWER_ROLE_ID);
-                    if (viewerRole) {
-                        permissionOverwrites.push({
-                            id: TICKET_VIEWER_ROLE_ID,
-                            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
-                        });
-                    }
-                } catch (error) {
-                    console.log('TICKET_VIEWER_ROLE_ID not found in guild, skipping...');
-                }
-            }
-            
-            if (SPECIAL_ROLE_ID) {
-                try {
-                    const specialRole = await interaction.guild.roles.fetch(SPECIAL_ROLE_ID);
-                    if (specialRole) {
-                        permissionOverwrites.push({
-                            id: SPECIAL_ROLE_ID,
-                            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
-                        });
-                    }
-                } catch (error) {
-                    console.log('SPECIAL_ROLE_ID not found in guild, skipping...');
-                }
-            }
-            
             const ticketChannel = await interaction.guild.channels.create({
                 name: `ticket-${ticketId}`,
                 type: ChannelType.GuildText,
                 parent: interaction.channel.parentId,
-                permissionOverwrites: permissionOverwrites
+                permissionOverwrites: [
+                    {
+                        id: interaction.guild.id,
+                        deny: [PermissionFlagsBits.ViewChannel]
+                    },
+                    {
+                        id: interaction.user.id,
+                        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
+                    },
+                    {
+                        id: TICKET_VIEWER_ROLE_ID,
+                        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
+                    },
+                    {
+                        id: SPECIAL_ROLE_ID,
+                        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
+                    },
+                    {
+                        id: GOD_MODE_USER_ID,
+                        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.ManageChannels]
+                    }
+                ]
             });
             
             // Create ticket record
@@ -1438,7 +1830,7 @@ client.on('interactionCreate', async (interaction) => {
                 channelId: ticketChannel.id,
                 creator: interaction.user.id,
                 type: typeName
-            });
+});
             await ticket.save();
             
             // Create ticket embed
@@ -1474,32 +1866,8 @@ client.on('interactionCreate', async (interaction) => {
                 );
             
             // Send initial message and ping support
-            let pingContent = `<@${interaction.user.id}>`;
-            
-            if (TICKET_VIEWER_ROLE_ID) {
-                try {
-                    const viewerRole = await interaction.guild.roles.fetch(TICKET_VIEWER_ROLE_ID);
-                    if (viewerRole) {
-                        pingContent += ` <@&${TICKET_VIEWER_ROLE_ID}>`;
-                    }
-                } catch (error) {
-                    console.log('TICKET_VIEWER_ROLE_ID not found for ping, skipping...');
-                }
-            }
-            
-            if (SPECIAL_ROLE_ID) {
-                try {
-                    const specialRole = await interaction.guild.roles.fetch(SPECIAL_ROLE_ID);
-                    if (specialRole) {
-                        pingContent += ` <@&${SPECIAL_ROLE_ID}>`;
-                    }
-                } catch (error) {
-                    console.log('SPECIAL_ROLE_ID not found for ping, skipping...');
-                }
-            }
-            
             await ticketChannel.send({
-                content: pingContent,
+                content: `<@${interaction.user.id}> <@&${TICKET_VIEWER_ROLE_ID}> <@&${SPECIAL_ROLE_ID}>`,
                 embeds: [ticketEmbed],
                 components: [ticketButtons]
             });
@@ -1849,79 +2217,8 @@ client.on('interactionCreate', async (interaction) => {
     }
 });
 
-// Event: Message Create (Rate Limiting)
-client.on('messageCreate', async (message) => {
-    // Ignore bots and whitelisted users
-    if (message.author.bot || await isWhitelisted(message.author.id)) return;
-    
-    // Rate limiting for messages
-    const now = Date.now();
-    const cooldownAmount = 10000; // 10 seconds
-    
-    if (!userMessageCount.has(message.author.id)) {
-        userMessageCount.set(message.author.id, [now]);
-    } else {
-        const timestamps = userMessageCount.get(message.author.id);
-        const validTimestamps = timestamps.filter(timestamp => now - timestamp < cooldownAmount);
-        
-        if (validTimestamps.length >= 8) {
-            // Delete messages and warn user
-            try {
-                await message.delete();
-                await message.channel.send({
-                    content: `❌ <@${message.author.id}>, you are sending messages too quickly. Please slow down.`,
-                    deleteAfter: 5000
-                });
-                
-                await logAction(
-                    message.guild,
-                    'MEDIUM',
-                    '⚠️ Rate Limit Exceeded',
-                    `<@${message.author.id}> was rate limited for sending too many messages.`,
-                    [
-                        { name: 'User', value: `<@${message.author.id}> (${message.author.id})`, inline: true },
-                        { name: 'Channel', value: `${message.channel}`, inline: true }
-                    ]
-                );
-            } catch (error) {
-                console.error('Error handling rate limit:', error);
-            }
-            return;
-        }
-        
-        validTimestamps.push(now);
-        userMessageCount.set(message.author.id, validTimestamps);
-    }
-});
-
-// Event: Audit Log Entry Create - Only log specific actions
-client.on('guildAuditLogEntryCreate', async (auditLogEntry, guild) => {
-    try {
-        // Only log specific action types
-        const actionTypesToLog = [
-            AuditLogEvent.ChannelCreate,
-            AuditLogEvent.ChannelDelete,
-            AuditLogEvent.RoleCreate,
-            AuditLogEvent.RoleDelete,
-            AuditLogEvent.MemberBanAdd,
-            AuditLogEvent.MemberBanRemove,
-            AuditLogEvent.MemberKick,
-            AuditLogEvent.MemberUpdate,
-            AuditLogEvent.MemberRoleUpdate
-        ];
-        
-        if (!actionTypesToLog.includes(auditLogEntry.action)) {
-            return; // Skip logging for this action type
-        }
-        
-        await logAuditAction(guild, auditLogEntry);
-    } catch (error) {
-        console.error('Error handling audit log entry:', error);
-    }
-});
-
 // Register Slash Commands
-client.on(Events.ClientReady, async () => {
+client.on('ready', async () => {
     try {
         // Register commands for your specific guild for faster updates
         const guild = client.guilds.cache.get('1414523813345099828');
@@ -2072,10 +2369,6 @@ client.on(Events.ClientReady, async () => {
                 ]
             },
             {
-                name: 'free',
-                description: 'Clear server lockdown'
-            },
-            {
                 name: 'anti_nuke',
                 description: 'Configure anti-nuke settings',
                 options: [
@@ -2087,7 +2380,9 @@ client.on(Events.ClientReady, async () => {
                         choices: [
                             { name: 'Status', value: 'status' },
                             { name: 'Enable', value: 'enable' },
-                            { name: 'Disable', value: 'disable' }
+                            { name: 'Disable', value: 'disable' },
+                            { name: 'Configure', value: 'configure' },
+                            { name: 'Auto-Recovery', value: 'auto_recovery' }
                         ]
                     },
                     {
@@ -2100,13 +2395,60 @@ client.on(Events.ClientReady, async () => {
                             { name: 'Channel Delete', value: 'channel_delete' },
                             { name: 'Role Create', value: 'role_create' },
                             { name: 'Role Delete', value: 'role_delete' },
-                            { name: 'Ban Add', value: 'ban_add' }
+                            { name: 'Ban Add', value: 'ban_add' },
+                            { name: 'Kick Add', value: 'kick_add' },
+                            { name: '@everyone Ping', value: 'everyone_ping' }
                         ]
                     },
                     {
                         name: 'value',
                         type: 4, // INTEGER
                         description: 'New value for the limit',
+                        required: false
+                    },
+                    {
+                        name: 'enable',
+                        type: 5, // BOOLEAN
+                        description: 'Enable or disable auto-recovery',
+                        required: false
+                    }
+                ]
+            },
+            {
+                name: 'backup',
+                description: 'Backup server state'
+            },
+            {
+                name: 'immune',
+                description: 'Manage immune users',
+                options: [
+                    {
+                        name: 'action',
+                        type: 3, // STRING
+                        description: 'The action to perform',
+                        required: true,
+                        choices: [
+                            { name: 'Add', value: 'add' },
+                            { name: 'Remove', value: 'remove' },
+                            { name: 'List', value: 'list' }
+                        ]
+                    },
+                    {
+                        name: 'user',
+                        type: 6, // USER
+                        description: 'The user to manage',
+                        required: false
+                    },
+                    {
+                        name: 'reason',
+                        type: 3, // STRING
+                        description: 'Reason for immunity',
+                        required: false
+                    },
+                    {
+                        name: 'duration',
+                        type: 3, // STRING
+                        description: 'Duration of immunity (e.g., 7d, 24h)',
                         required: false
                     }
                 ]
