@@ -15,9 +15,7 @@ const {
     AuditLogEvent,
     ModalBuilder,
     TextInputBuilder,
-    TextInputStyle,
-    TextChannel,
-    Role
+    TextInputStyle
 } = require('discord.js');
 const mongoose = require('mongoose');
 const express = require('express');
@@ -65,10 +63,8 @@ const client = new Client({
 });
 
 // MongoDB Connection
-mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/teamjupiter', {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
-}).then(() => {
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/teamjupiter')
+.then(() => {
     console.log('Connected to MongoDB');
 }).catch(err => {
     console.error('MongoDB connection error:', err);
@@ -90,7 +86,8 @@ const guildSettingsSchema = new mongoose.Schema({
     maxKickAdd: { type: Number, default: 3 },
     maxEveryonePing: { type: Number, default: 1 },
     lockdownMode: { type: Boolean, default: false },
-    autoRecovery: { type: Boolean, default: true }
+    autoRecovery: { type: Boolean, default: true },
+    maxTicketsPerUser: { type: Number, default: 3 } // Allow multiple tickets per user
 });
 const GuildSettings = mongoose.model('GuildSettings', guildSettingsSchema);
 
@@ -329,7 +326,7 @@ async function backupServerState(guild) {
                 id: emoji.id,
                 name: emoji.name,
                 animated: emoji.animated,
-                url: emoji.url
+                url: emoji.imageURL()
             });
         });
 
@@ -588,10 +585,9 @@ async function monitorAuditLogs(guild) {
                     
                     // Check if threshold is exceeded
                     if (record.count >= maxActions) {
-                        // INSTANT BAN for nuke attempt
                         try {
                             const member = await guild.members.fetch(executorId);
-                            if (member) {
+                            if (member && member.bannable) {
                                 await member.ban({ reason: 'Auto-ban: Attempted server nuke' });
                                 
                                 // Log the critical event
@@ -654,15 +650,45 @@ async function monitorAuditLogs(guild) {
                                 
                                 // Enable lockdown mode
                                 await lockServer(guild, 'System (Auto)', '30m');
+                            } else {
+                                // If we can't ban, at least kick the user
+                                if (member && member.kickable) {
+                                    await member.kick('Auto-kick: Attempted server nuke (ban failed)');
+                                    await logAction(
+                                        guild, 
+                                        'HIGH', 
+                                        '⚠️ AUTO-KICK TRIGGERED', 
+                                        `User <@${executorId}> was automatically kicked for attempted server nuke (ban failed).`,
+                                        [
+                                            { name: 'User', value: `<@${executorId}> (${executorId})`, inline: true },
+                                            { name: 'Action Type', value: actionName, inline: true },
+                                            { name: 'Count', value: `${record.count}/${maxActions}`, inline: true }
+                                        ],
+                                        true
+                                    );
+                                }
                             }
                         } catch (error) {
-                            console.error('Error auto-banning user:', error);
+                            console.error('Error taking action against user:', error);
+                            // Log the error but don't let it crash the bot
+                            await logAction(
+                                guild,
+                                'HIGH',
+                                '❌ Auto-Action Failed',
+                                `Failed to take action against user <@${executorId}> for nuke attempt.`,
+                                [
+                                    { name: 'Error', value: error.message, inline: false }
+                                ]
+                            );
                         }
                         
                         // Reset the count after action
-                        record.count = 0;
-                        record.targets = [];
-                        actionMap.set(executorId, record);
+                        if (actionMap.has(executorId)) {
+                            const record = actionMap.get(executorId);
+                            record.count = 0;
+                            record.targets = [];
+                            actionMap.set(executorId, record);
+                        }
                     }
                 }
             }
@@ -708,7 +734,7 @@ async function monitorEveryonePings(message) {
                         
                         // Timeout the user for 5 minutes
                         const member = await message.guild.members.fetch(executorId);
-                        if (member) {
+                        if (member && member.moderatable) {
                             await member.timeout(5 * 60 * 1000, 'Auto-timeout: Excessive @everyone pings');
                             
                             // Log the action
@@ -730,8 +756,11 @@ async function monitorEveryonePings(message) {
                     }
                     
                     // Reset the count after action
-                    record.count = 0;
-                    recentActions.everyonePing.set(executorId, record);
+                    if (recentActions.everyonePing.has(executorId)) {
+                        const record = recentActions.everyonePing.get(executorId);
+                        record.count = 0;
+                        recentActions.everyonePing.set(executorId, record);
+                    }
                 }
             }
         }
@@ -741,7 +770,7 @@ async function monitorEveryonePings(message) {
 }
 
 // Event: Ready
-client.once('ready', async () => {
+client.once('clientReady', async () => {
     console.log(`Logged in as ${client.user.tag}!`);
     
     // Set activity status
@@ -1306,19 +1335,22 @@ client.on('interactionCreate', async (interaction) => {
             // Auto-kick on 3rd warning
             if (totalWarnings >= 3) {
                 try {
-                    await interaction.guild.members.kick(user.id, 'Auto-kick: Reached 3 warnings');
-                    
-                    await logAction(
-                        interaction.guild,
-                        'HIGH',
-                        '🚫 User Auto-Kicked',
-                        `<@${user.id}> was automatically kicked for reaching 3 warnings.`,
-                        [
-                            { name: 'User', value: `<@${user.id}> (${user.id})`, inline: true },
-                            { name: 'Moderator', value: 'System (Auto)', inline: true },
-                            { name: 'Reason', value: 'Reached 3 warnings', inline: false }
-                        ]
-                    );
+                    const member = await interaction.guild.members.fetch(user.id);
+                    if (member && member.kickable) {
+                        await member.kick('Auto-kick: Reached 3 warnings');
+                        
+                        await logAction(
+                            interaction.guild,
+                            'HIGH',
+                            '🚫 User Auto-Kicked',
+                            `<@${user.id}> was automatically kicked for reaching 3 warnings.`,
+                            [
+                                { name: 'User', value: `<@${user.id}> (${user.id})`, inline: true },
+                                { name: 'Moderator', value: 'System (Auto)', inline: true },
+                                { name: 'Reason', value: 'Reached 3 warnings', inline: false }
+                            ]
+                        );
+                    }
                 } catch (error) {
                     console.error('Error auto-kicking user:', error);
                 }
@@ -1781,15 +1813,16 @@ client.on('interactionCreate', async (interaction) => {
                 case 'ally': typeName = 'Ally/Merge'; break;
             }
             
-            // Check if user already has an open ticket
-            const existingTicket = await Tickets.findOne({ 
+            // Check if user has too many open tickets
+            const settings = await getGuildSettings(interaction.guild.id);
+            const openTickets = await Tickets.find({ 
                 creator: interaction.user.id, 
                 closed: false 
             });
             
-            if (existingTicket) {
+            if (openTickets.length >= settings.maxTicketsPerUser) {
                 await interaction.reply({ 
-                    content: `❌ You already have an open ticket: <#${existingTicket.channelId}>`, 
+                    content: `❌ You already have ${openTickets.length} open tickets. Please close some before creating new ones.`, 
                     ephemeral: true 
                 });
                 return;
@@ -1830,7 +1863,7 @@ client.on('interactionCreate', async (interaction) => {
                 channelId: ticketChannel.id,
                 creator: interaction.user.id,
                 type: typeName
-});
+            });
             await ticket.save();
             
             // Create ticket embed
@@ -2218,7 +2251,7 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 // Register Slash Commands
-client.on('ready', async () => {
+client.once('clientReady', async () => {
     try {
         // Register commands for your specific guild for faster updates
         const guild = client.guilds.cache.get('1414523813345099828');
