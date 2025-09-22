@@ -12,10 +12,7 @@ const {
     ChannelType,
     PermissionFlagsBits,
     Events,
-    AuditLogEvent,
-    ModalBuilder,
-    TextInputBuilder,
-    TextInputStyle
+    AuditLogEvent
 } = require('discord.js');
 const mongoose = require('mongoose');
 const express = require('express');
@@ -76,7 +73,6 @@ const guildSettingsSchema = new mongoose.Schema({
     guildId: { type: String, required: true, unique: true },
     welcomeChannelId: String,
     logChannelId: String,
-    ticketChannelId: String,
     antiNukeEnabled: { type: Boolean, default: true },
     maxChannelCreate: { type: Number, default: 2 },
     maxChannelDelete: { type: Number, default: 2 },
@@ -87,9 +83,8 @@ const guildSettingsSchema = new mongoose.Schema({
     maxEveryonePing: { type: Number, default: 1 },
     lockdownMode: { type: Boolean, default: false },
     autoRecovery: { type: Boolean, default: true },
-    maxTicketsPerUser: { type: Number, default: 3 },
-    supportRoleId: String, // Added support role ID field
-    adminRoleId: String    // Added admin role ID field
+    autoBackup: { type: Boolean, default: true },
+    backupInterval: { type: Number, default: 3600000 } // 1 hour default
 });
 const GuildSettings = mongoose.model('GuildSettings', guildSettingsSchema);
 
@@ -114,25 +109,6 @@ const warningsSchema = new mongoose.Schema({
 });
 const Warnings = mongoose.model('Warnings', warningsSchema);
 
-// Tickets Schema
-const ticketsSchema = new mongoose.Schema({
-    channelId: { type: String, required: true, unique: true },
-    creator: { type: String, required: true },
-    type: { type: String, required: true },
-    claimedBy: String,
-    locked: { type: Boolean, default: false },
-    closed: { type: Boolean, default: false },
-    createdAt: { type: Date, default: Date.now },
-    closedAt: Date,
-    messages: [{
-        author: String,
-        content: String,
-        timestamp: Date,
-        attachments: [String]
-    }]
-});
-const Tickets = mongoose.model('Tickets', ticketsSchema);
-
 // Immune Users Schema
 const immuneSchema = new mongoose.Schema({
     userId: { type: String, required: true, unique: true },
@@ -156,6 +132,58 @@ const securityLogSchema = new mongoose.Schema({
 });
 const SecurityLog = mongoose.model('SecurityLog', securityLogSchema);
 
+// Backup Schema
+const backupSchema = new mongoose.Schema({
+    guildId: { type: String, required: true },
+    name: { type: String, required: true },
+    timestamp: { type: Date, default: Date.now },
+    channels: [{
+        id: String,
+        name: String,
+        type: Number,
+        parent: String,
+        position: Number,
+        permissionOverwrites: [{
+            id: String,
+            type: Number,
+            allow: Number,
+            deny: Number
+        }],
+        topic: String,
+        nsfw: Boolean,
+        rateLimitPerUser: Number,
+        bitrate: Number,
+        userLimit: Number,
+        rtcRegion: String,
+        videoQualityMode: Number
+    }],
+    roles: [{
+        id: String,
+        name: String,
+        color: Number,
+        hoist: Boolean,
+        position: Number,
+        permissions: Number,
+        mentionable: Boolean,
+        icon: String,
+        unicodeEmoji: String
+    }],
+    emojis: [{
+        id: String,
+        name: String,
+        animated: Boolean,
+        url: String
+    }],
+    webhooks: [{
+        id: String,
+        name: String,
+        channelId: String,
+        avatar: String,
+        token: String
+    }]
+});
+const Backup = mongoose.model('Backup', backupSchema);
+
 // Client setup
 client.commands = new Collection();
 client.cooldowns = new Collection();
@@ -171,32 +199,17 @@ const recentActions = {
     everyonePing: new Map()
 };
 
-// Cache for channel/role backups
-const serverStateCache = {
-    channels: new Map(),
-    roles: new Map(),
-    emojis: new Map(),
-    webhooks: new Map()
-};
-
 // Rate limiting for commands and messages
 const userCommandUsage = new Map();
 const userMessageCount = new Map();
 
 // Constants
 const GOD_MODE_USER_ID = process.env.GOD_MODE_USER_ID || '1202998273376522321';
-const TICKET_VIEWER_ROLE_ID = process.env.TICKET_VIEWER_ROLE_ID;
-const SPECIAL_ROLE_ID = process.env.SPECIAL_ROLE_ID || '1414824820901679155';
-const ADMIN_ROLE_ID = process.env.ADMIN_ROLE_ID;
 const ALERT_USER_ID = '1202998273376522331'; // User to ping for critical actions
 
 // Utility Functions
 function generateWarningId() {
     return 'WRN' + Math.random().toString(36).substring(2, 10).toUpperCase();
-}
-
-function generateTicketId() {
-    return 'TKT' + Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
 async function isWhitelisted(userId) {
@@ -222,10 +235,7 @@ async function getGuildSettings(guildId) {
         settings = new GuildSettings({
             guildId: guildId,
             welcomeChannelId: process.env.WELCOME_CHANNEL_ID || null,
-            logChannelId: process.env.LOG_CHANNEL_ID || null,
-            ticketChannelId: process.env.TICKET_CHANNEL_ID || null,
-            supportRoleId: process.env.SUPPORT_ROLE_ID || null,
-            adminRoleId: process.env.ADMIN_ROLE_ID || null
+            logChannelId: process.env.LOG_CHANNEL_ID || null
         });
         await settings.save();
     }
@@ -279,14 +289,31 @@ async function logAction(guild, level, title, description, fields = [], ping = f
         await securityLog.save();
     } catch (error) {
         console.error('Error logging action:', error);
+        // Try to DM the alert user if log channel fails
+        try {
+            const alertUser = await client.users.fetch(ALERT_USER_ID);
+            await alertUser.send(`❌ Failed to log action in ${guild.name}: ${error.message}`);
+        } catch (dmError) {
+            console.error('Failed to DM alert user:', dmError);
+        }
     }
 }
 
-async function backupServerState(guild) {
+async function backupServerState(guild, backupName = 'Manual Backup') {
     try {
+        const backupData = {
+            guildId: guild.id,
+            name: backupName,
+            timestamp: new Date(),
+            channels: [],
+            roles: [],
+            emojis: [],
+            webhooks: []
+        };
+
         // Backup channels
         guild.channels.cache.forEach(channel => {
-            serverStateCache.channels.set(channel.id, {
+            backupData.channels.push({
                 id: channel.id,
                 name: channel.name,
                 type: channel.type,
@@ -311,7 +338,7 @@ async function backupServerState(guild) {
         // Backup roles
         guild.roles.cache.forEach(role => {
             if (role.id === guild.id) return; // Skip @everyone role
-            serverStateCache.roles.set(role.id, {
+            backupData.roles.push({
                 id: role.id,
                 name: role.name,
                 color: role.color,
@@ -326,7 +353,7 @@ async function backupServerState(guild) {
 
         // Backup emojis
         guild.emojis.cache.forEach(emoji => {
-            serverStateCache.emojis.set(emoji.id, {
+            backupData.emojis.push({
                 id: emoji.id,
                 name: emoji.name,
                 animated: emoji.animated,
@@ -337,7 +364,7 @@ async function backupServerState(guild) {
         // Backup webhooks
         const webhooks = await guild.fetchWebhooks();
         webhooks.forEach(webhook => {
-            serverStateCache.webhooks.set(webhook.id, {
+            backupData.webhooks.push({
                 id: webhook.id,
                 name: webhook.name,
                 channelId: webhook.channelId,
@@ -346,74 +373,150 @@ async function backupServerState(guild) {
             });
         });
 
+        // Save to database
+        const backup = new Backup(backupData);
+        await backup.save();
+
         console.log(`Server state backed up for ${guild.name}`);
+        
+        // Log the backup
+        await logAction(
+            guild,
+            'LOW',
+            '💾 Server Backup Created',
+            `Server state has been backed up: ${backupName}`,
+            [
+                { name: 'Channels', value: backupData.channels.length.toString(), inline: true },
+                { name: 'Roles', value: backupData.roles.length.toString(), inline: true },
+                { name: 'Emojis', value: backupData.emojis.length.toString(), inline: true },
+                { name: 'Backup Name', value: backupName, inline: true }
+            ]
+        );
+        
+        return backup;
     } catch (error) {
         console.error('Error backing up server state:', error);
+        await logAction(
+            guild,
+            'HIGH',
+            '❌ Backup Failed',
+            `Failed to create server backup: ${error.message}`,
+            [],
+            true
+        );
+        throw error;
     }
 }
 
-async function restoreChannels(guild, channelIds) {
-    const restoredChannels = [];
-    for (const channelId of channelIds) {
-        const backup = serverStateCache.channels.get(channelId);
-        if (!backup) continue;
-
-        try {
-            const existingChannel = guild.channels.cache.get(channelId);
-            if (existingChannel) continue; // Channel already exists
-
-            const options = {
-                name: backup.name,
-                type: backup.type,
-                parent: backup.parent,
-                position: backup.position,
-                topic: backup.topic,
-                nsfw: backup.nsfw,
-                rateLimitPerUser: backup.rateLimitPerUser,
-                permissionOverwrites: backup.permissionOverwrites,
-                bitrate: backup.bitrate,
-                userLimit: backup.userLimit,
-                rtcRegion: backup.rtcRegion,
-                videoQualityMode: backup.videoQualityMode
-            };
-
-            const newChannel = await guild.channels.create(options);
-            restoredChannels.push(newChannel);
-        } catch (error) {
-            console.error(`Error restoring channel ${channelId}:`, error);
+async function restoreBackup(guild, backupId) {
+    try {
+        const backup = await Backup.findOne({ _id: backupId, guildId: guild.id });
+        if (!backup) {
+            throw new Error('Backup not found');
         }
-    }
-    return restoredChannels;
-}
 
-async function restoreRoles(guild, roleIds) {
-    const restoredRoles = [];
-    for (const roleId of roleIds) {
-        const backup = serverStateCache.roles.get(roleId);
-        if (!backup) continue;
+        const restoredItems = {
+            channels: 0,
+            roles: 0,
+            emojis: 0
+        };
 
-        try {
-            const existingRole = guild.roles.cache.get(roleId);
-            if (existingRole) continue; // Role already exists
-
-            const options = {
-                name: backup.name,
-                color: backup.color,
-                hoist: backup.hoist,
-                position: backup.position,
-                permissions: backup.permissions,
-                mentionable: backup.mentionable,
-                icon: backup.icon,
-                unicodeEmoji: backup.unicodeEmoji
-            };
-
-            const newRole = await guild.roles.create(options);
-            restoredRoles.push(newRole);
-        } catch (error) {
-            console.error(`Error restoring role ${roleId}:`, error);
+        // Restore roles first (channels might need them)
+        for (const roleData of backup.roles) {
+            try {
+                // Check if role already exists
+                const existingRole = guild.roles.cache.get(roleData.id);
+                if (existingRole) {
+                    // Update existing role
+                    await existingRole.edit({
+                        name: roleData.name,
+                        color: roleData.color,
+                        hoist: roleData.hoist,
+                        mentionable: roleData.mentionable,
+                        permissions: roleData.permissions
+                    });
+                } else {
+                    // Create new role
+                    await guild.roles.create({
+                        name: roleData.name,
+                        color: roleData.color,
+                        hoist: roleData.hoist,
+                        mentionable: roleData.mentionable,
+                        permissions: roleData.permissions,
+                        reason: 'Auto-restore from backup'
+                    });
+                }
+                restoredItems.roles++;
+            } catch (error) {
+                console.error(`Error restoring role ${roleData.name}:`, error);
+            }
         }
+
+        // Restore channels
+        for (const channelData of backup.channels) {
+            try {
+                // Check if channel already exists
+                const existingChannel = guild.channels.cache.get(channelData.id);
+                if (existingChannel) {
+                    // Update existing channel
+                    await existingChannel.edit({
+                        name: channelData.name,
+                        parent: channelData.parent,
+                        position: channelData.position,
+                        topic: channelData.topic,
+                        nsfw: channelData.nsfw,
+                        rateLimitPerUser: channelData.rateLimitPerUser,
+                        permissionOverwrites: channelData.permissionOverwrites
+                    });
+                } else {
+                    // Create new channel
+                    await guild.channels.create({
+                        name: channelData.name,
+                        type: channelData.type,
+                        parent: channelData.parent,
+                        position: channelData.position,
+                        topic: channelData.topic,
+                        nsfw: channelData.nsfw,
+                        rateLimitPerUser: channelData.rateLimitPerUser,
+                        permissionOverwrites: channelData.permissionOverwrites,
+                        reason: 'Auto-restore from backup'
+                    });
+                }
+                restoredItems.channels++;
+            } catch (error) {
+                console.error(`Error restoring channel ${channelData.name}:`, error);
+            }
+        }
+
+        // Log the restoration
+        await logAction(
+            guild,
+            'HIGH',
+            '🔧 Server Restoration',
+            `Server state has been restored from backup: ${backup.name}`,
+            [
+                { name: 'Channels Restored', value: restoredItems.channels.toString(), inline: true },
+                { name: 'Roles Restored', value: restoredItems.roles.toString(), inline: true },
+                { name: 'Emojis Restored', value: restoredItems.emojis.toString(), inline: true },
+                { name: 'Backup Name', value: backup.name, inline: true },
+                { name: 'Backup Date', value: `<t:${Math.floor(backup.timestamp.getTime() / 1000)}:R>`, inline: true }
+            ],
+            true
+        );
+
+        return restoredItems;
+    } catch (error) {
+        console.error('Error restoring backup:', error);
+        await logAction(
+            guild,
+            'CRITICAL',
+            '❌ Restoration Failed',
+            `Failed to restore server from backup: ${error.message}`,
+            [],
+            true
+        );
+        throw error;
     }
-    return restoredRoles;
 }
 
 async function lockServer(guild, moderatorId, duration = '10m') {
@@ -439,7 +542,10 @@ async function lockServer(guild, moderatorId, duration = '10m') {
         try {
             await channel.permissionOverwrites.edit(guild.id, {
                 SendMessages: false,
-                AddReactions: false
+                AddReactions: false,
+                CreatePublicThreads: false,
+                CreatePrivateThreads: false,
+                SendMessagesInThreads: false
             });
             lockedCount++;
         } catch (error) {
@@ -457,7 +563,8 @@ async function lockServer(guild, moderatorId, duration = '10m') {
             { name: 'Channels Locked', value: lockedCount.toString(), inline: true },
             { name: 'Duration', value: duration, inline: true },
             { name: 'Moderator', value: `<@${moderatorId}>`, inline: true }
-        ]
+        ],
+        true
     );
     
     // Auto-unlock after duration
@@ -483,7 +590,10 @@ async function unlockServer(guild, moderator = 'System') {
         try {
             await channel.permissionOverwrites.edit(guild.id, {
                 SendMessages: null,
-                AddReactions: null
+                AddReactions: null,
+                CreatePublicThreads: null,
+                CreatePrivateThreads: null,
+                SendMessagesInThreads: null
             });
             unlockedCount++;
         } catch (error) {
@@ -500,7 +610,8 @@ async function unlockServer(guild, moderator = 'System') {
         [
             { name: 'Channels Unlocked', value: unlockedCount.toString(), inline: true },
             { name: 'Moderator', value: moderator, inline: true }
-        ]
+        ],
+        true
     );
     
     return unlockedCount;
@@ -611,26 +722,23 @@ async function monitorAuditLogs(guild) {
                                 
                                 // Auto-recovery for deletions if enabled
                                 if (settings.autoRecovery) {
+                                    // Create emergency backup before restoration
+                                    await backupServerState(guild, 'Emergency Pre-Recovery Backup');
+                                    
                                     if (actionType === AuditLogEvent.ChannelDelete) {
-                                        const restoredChannels = await restoreChannels(guild, record.targets);
-                                        
-                                        await logAction(
-                                            guild,
-                                            'HIGH',
-                                            '🔧 Auto-Recovery: Channels Restored',
-                                            `Attempted to restore ${restoredChannels.length} channels deleted by nuke attempt.`
-                                        );
+                                        // Get latest backup
+                                        const latestBackup = await Backup.findOne({ guildId: guild.id }).sort({ timestamp: -1 });
+                                        if (latestBackup) {
+                                            await restoreBackup(guild, latestBackup._id);
+                                        }
                                     }
                                     
                                     if (actionType === AuditLogEvent.RoleDelete) {
-                                        const restoredRoles = await restoreRoles(guild, record.targets);
-                                        
-                                        await logAction(
-                                            guild,
-                                            'HIGH',
-                                            '🔧 Auto-Recovery: Roles Restored',
-                                            `Attempted to restore ${restoredRoles.length} roles deleted by nuke attempt.`
-                                        );
+                                        // Get latest backup
+                                        const latestBackup = await Backup.findOne({ guildId: guild.id }).sort({ timestamp: -1 });
+                                        if (latestBackup) {
+                                            await restoreBackup(guild, latestBackup._id);
+                                        }
                                     }
                                     
                                     if (actionType === AuditLogEvent.MemberBanAdd) {
@@ -647,7 +755,9 @@ async function monitorAuditLogs(guild) {
                                             guild,
                                             'HIGH',
                                             '🔧 Auto-Recovery: Bans Reverted',
-                                            `Attempted to unban ${record.targets.length} users banned by nuke attempt.`
+                                            `Attempted to unban ${record.targets.length} users banned by nuke attempt.`,
+                                            [],
+                                            true
                                         );
                                     }
                                 }
@@ -682,7 +792,8 @@ async function monitorAuditLogs(guild) {
                                 `Failed to take action against user <@${executorId}> for nuke attempt.`,
                                 [
                                     { name: 'Error', value: error.message, inline: false }
-                                ]
+                                ],
+                                true
                             );
                         }
                         
@@ -699,6 +810,14 @@ async function monitorAuditLogs(guild) {
         }
     } catch (error) {
         console.error('Error monitoring audit logs:', error);
+        await logAction(
+            guild,
+            'HIGH',
+            '❌ Audit Log Monitoring Error',
+            `Failed to monitor audit logs: ${error.message}`,
+            [],
+            true
+        );
     }
 }
 
@@ -757,6 +876,14 @@ async function monitorEveryonePings(message) {
                         }
                     } catch (error) {
                         console.error('Error timing out user:', error);
+                        await logAction(
+                            message.guild,
+                            'HIGH',
+                            '❌ Timeout Failed',
+                            `Failed to timeout user <@${executorId}> for excessive pings: ${error.message}`,
+                            [],
+                            true
+                        );
                     }
                     
                     // Reset the count after action
@@ -770,6 +897,14 @@ async function monitorEveryonePings(message) {
         }
     } catch (error) {
         console.error('Error monitoring @everyone pings:', error);
+        await logAction(
+            message.guild,
+            'HIGH',
+            '❌ Ping Monitoring Error',
+            `Failed to monitor @everyone pings: ${error.message}`,
+            [],
+            true
+        );
     }
 }
 
@@ -780,9 +915,25 @@ client.once('ready', async () => {
     // Set activity status
     client.user.setActivity('Team Jupiter', { type: 'WATCHING' });
     
-    // Backup server state for all guilds
-    client.guilds.cache.forEach(guild => {
-        backupServerState(guild);
+    // Backup server state for all guilds and set up auto-backup
+    client.guilds.cache.forEach(async guild => {
+        try {
+            const settings = await getGuildSettings(guild.id);
+            await backupServerState(guild, 'Initial Backup');
+            
+            // Set up auto-backup if enabled
+            if (settings.autoBackup) {
+                setInterval(async () => {
+                    try {
+                        await backupServerState(guild, 'Auto Backup');
+                    } catch (error) {
+                        console.error(`Auto-backup failed for ${guild.name}:`, error);
+                    }
+                }, settings.backupInterval);
+            }
+        } catch (error) {
+            console.error(`Failed to initialize backup for ${guild.name}:`, error);
+        }
     });
     
     // Start monitoring audit logs
@@ -805,6 +956,22 @@ client.once('ready', async () => {
             console.error('Error cleaning up expired immunity records:', error);
         }
     }, 3600000); // Run every hour
+    
+    // Clean up old backups (keep only the 5 most recent)
+    setInterval(async () => {
+        try {
+            for (const guild of client.guilds.cache.values()) {
+                const backups = await Backup.find({ guildId: guild.id }).sort({ timestamp: -1 });
+                if (backups.length > 5) {
+                    const idsToDelete = backups.slice(5).map(b => b._id);
+                    await Backup.deleteMany({ _id: { $in: idsToDelete } });
+                    console.log(`Cleaned up ${idsToDelete.length} old backups for ${guild.name}`);
+                }
+            }
+        } catch (error) {
+            console.error('Error cleaning up old backups:', error);
+        }
+    }, 86400000); // Run every 24 hours
 });
 
 // Event: Guild Member Add (Welcome System)
@@ -835,7 +1002,8 @@ client.on('guildMemberAdd', async (member) => {
                     { name: 'User', value: `${member.user.tag} (${member.user.id})`, inline: true },
                     { name: 'Account Age', value: `${Math.floor(accountAge / (24 * 60 * 60 * 1000))} days`, inline: true },
                     { name: 'Created', value: `<t:${Math.floor(member.user.createdTimestamp / 1000)}:R>`, inline: true }
-                ]
+                ],
+                true
             );
         }
         
@@ -865,6 +1033,14 @@ client.on('guildMemberAdd', async (member) => {
         );
     } catch (error) {
         console.error('Error sending welcome message:', error);
+        await logAction(
+            member.guild,
+            'HIGH',
+            '❌ Welcome Error',
+            `Failed to send welcome message: ${error.message}`,
+            [],
+            true
+        );
     }
 });
 
@@ -884,6 +1060,14 @@ client.on('guildMemberRemove', async (member) => {
         );
     } catch (error) {
         console.error('Error logging member leave:', error);
+        await logAction(
+            member.guild,
+            'HIGH',
+            '❌ Member Leave Error',
+            `Failed to log member leave: ${error.message}`,
+            [],
+            true
+        );
     }
 });
 
@@ -922,10 +1106,19 @@ client.on('messageCreate', async (message) => {
                     [
                         { name: 'User', value: `<@${message.author.id}> (${message.author.id})`, inline: true },
                         { name: 'Channel', value: `${message.channel}`, inline: true }
-                    ]
+                    ],
+                    true
                 );
             } catch (error) {
                 console.error('Error handling rate limit:', error);
+                await logAction(
+                    message.guild,
+                    'HIGH',
+                    '❌ Rate Limit Error',
+                    `Failed to handle rate limit: ${error.message}`,
+                    [],
+                    true
+                );
             }
             return;
         }
@@ -1030,7 +1223,8 @@ client.on('interactionCreate', async (interaction) => {
                     { name: 'User', value: `<@${user.id}> (${user.id})`, inline: true },
                     { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true },
                     { name: 'Reason', value: reason, inline: false }
-                ]
+                ],
+                true
             );
         }
         
@@ -1089,7 +1283,8 @@ client.on('interactionCreate', async (interaction) => {
                 [
                     { name: 'User', value: `<@${user.id}> (${user.id})`, inline: true },
                     { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true }
-                ]
+                ],
+                true
             );
         }
         
@@ -1131,7 +1326,8 @@ client.on('interactionCreate', async (interaction) => {
                 [
                     { name: 'Channel', value: `${channel.name} (${channel.id})`, inline: true },
                     { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true }
-                ]
+                ],
+                true
             );
         }
         
@@ -1173,70 +1369,8 @@ client.on('interactionCreate', async (interaction) => {
                 [
                     { name: 'Channel', value: `${channel.name} (${channel.id})`, inline: true },
                     { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true }
-                ]
-            );
-        }
-        
-        else if (interaction.commandName === 'setup_tickets') {
-            const channel = interaction.options.getChannel('channel');
-            if (!channel) {
-                await interaction.reply({ 
-                    content: '❌ Please specify a valid channel.', 
-                    ephemeral: true 
-                });
-                return;
-            }
-            
-            // Update guild settings
-            const settings = await getGuildSettings(interaction.guild.id);
-            settings.ticketChannelId = channel.id;
-            await settings.save();
-            
-            // Create ticket panel
-            const embed = new EmbedBuilder()
-                .setTitle('🎫 Team Jupiter Support')
-                .setColor(0x0099FF)
-                .setDescription('Please select the type of ticket you would like to create:\n\n• **General Support**: For general questions and support\n• **Team Apply**: To apply for our team\n• **Ally/Merge**: For alliance or server merge requests\n\n**⚠️ Note**: Creating tickets for fun or without reason will result in a 1-day timeout.')
-                .setFooter({ text: 'Team Jupiter Support System', iconURL: interaction.guild.iconURL() })
-                .setTimestamp();
-            
-            const buttons = new ActionRowBuilder()
-                .addComponents(
-                    new ButtonBuilder()
-                        .setCustomId('ticket_general')
-                        .setLabel('General Support')
-                        .setEmoji('🔥')
-                        .setStyle(ButtonStyle.Primary),
-                    new ButtonBuilder()
-                        .setCustomId('ticket_apply')
-                        .setLabel('Team Apply')
-                        .setEmoji('💜')
-                        .setStyle(ButtonStyle.Secondary),
-                    new ButtonBuilder()
-                        .setCustomId('ticket_ally')
-                        .setLabel('Ally/Merge')
-                        .setEmoji('🤝')
-                        .setStyle(ButtonStyle.Success)
-                );
-            
-            await channel.send({ embeds: [embed], components: [buttons] });
-            
-            // Success response (ephemeral)
-            await interaction.reply({ 
-                content: `✅ Ticket panel has been created in ${channel}.`, 
-                ephemeral: true 
-            });
-            
-            // Log the action
-            await logAction(
-                interaction.guild,
-                'LOW',
-                '⚙️ Ticket System Configured',
-                `Ticket panel has been created in ${channel}.`,
-                [
-                    { name: 'Channel', value: `${channel.name} (${channel.id})`, inline: true },
-                    { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true }
-                ]
+                ],
+                true
             );
         }
         
@@ -1333,7 +1467,8 @@ client.on('interactionCreate', async (interaction) => {
                     { name: 'Severity', value: severity, inline: true },
                     { name: 'Warning ID', value: warningId, inline: true },
                     { name: 'Total Warnings', value: `${totalWarnings}/3`, inline: true }
-                ]
+                ],
+                true
             );
             
             // Auto-kick on 3rd warning
@@ -1352,11 +1487,20 @@ client.on('interactionCreate', async (interaction) => {
                                 { name: 'User', value: `<@${user.id}> (${user.id})`, inline: true },
                                 { name: 'Moderator', value: 'System (Auto)', inline: true },
                                 { name: 'Reason', value: 'Reached 3 warnings', inline: false }
-                            ]
+                            ],
+                            true
                         );
                     }
                 } catch (error) {
                     console.error('Error auto-kicking user:', error);
+                    await logAction(
+                        interaction.guild,
+                        'HIGH',
+                        '❌ Auto-Kick Failed',
+                        `Failed to auto-kick user <@${user.id}>: ${error.message}`,
+                        [],
+                        true
+                    );
                 }
             }
         }
@@ -1418,6 +1562,7 @@ client.on('interactionCreate', async (interaction) => {
             const warningCount = await Warnings.countDocuments({ guildId: interaction.guild.id });
             const immuneCount = await Immune.countDocuments();
             const securityLogCount = await SecurityLog.countDocuments({ guildId: interaction.guild.id });
+            const backupCount = await Backup.countDocuments({ guildId: interaction.guild.id });
             
             const settings = await getGuildSettings(interaction.guild.id);
             
@@ -1429,13 +1574,14 @@ client.on('interactionCreate', async (interaction) => {
                 .addFields(
                     { name: 'Anti-Nuke Protection', value: settings.antiNukeEnabled ? '✅ Active' : '❌ Disabled', inline: true },
                     { name: 'Auto-Recovery System', value: settings.autoRecovery ? '✅ Active' : '❌ Disabled', inline: true },
+                    { name: 'Auto-Backup System', value: settings.autoBackup ? '✅ Active' : '❌ Disabled', inline: true },
                     { name: 'Rate Limiting', value: '✅ Active', inline: true },
                     { name: 'Whitelisted Users', value: whitelistCount.toString(), inline: true },
                     { name: 'Total Warnings', value: warningCount.toString(), inline: true },
                     { name: 'Immune Users', value: immuneCount.toString(), inline: true },
                     { name: 'Security Logs', value: securityLogCount.toString(), inline: true },
+                    { name: 'Available Backups', value: backupCount.toString(), inline: true },
                     { name: 'Lockdown Mode', value: settings.lockdownMode ? '🔒 Active' : '🔓 Inactive', inline: true },
-                    { name: 'Ticket System', value: settings.ticketChannelId ? '✅ Active' : '❌ Not Setup', inline: true },
                     { name: 'Welcome System', value: settings.welcomeChannelId ? '✅ Active' : '❌ Not Setup', inline: true },
                     { name: 'Channel Create Limit', value: settings.maxChannelCreate.toString(), inline: true },
                     { name: 'Channel Delete Limit', value: settings.maxChannelDelete.toString(), inline: true },
@@ -1502,7 +1648,7 @@ client.on('interactionCreate', async (interaction) => {
                 .setThumbnail(interaction.guild.iconURL())
                 .addFields(
                     { name: 'Status', value: settings.antiNukeEnabled ? '✅ Enabled' : '❌ Disabled', inline: true },
-                    { name: 'Auto-Recovery', value: settings.autoRecocovery ? '✅ Enabled' : '❌ Disabled', inline: true },
+                    { name: 'Auto-Recovery', value: settings.autoRecovery ? '✅ Enabled' : '❌ Disabled', inline: true },
                     { name: 'Channel Create Limit', value: settings.maxChannelCreate.toString(), inline: true },
                     { name: 'Channel Delete Limit', value: settings.maxChannelDelete.toString(), inline: true },
                     { name: 'Role Create Limit', value: settings.maxRoleCreate.toString(), inline: true },
@@ -1528,7 +1674,9 @@ client.on('interactionCreate', async (interaction) => {
                     interaction.guild,
                     'HIGH',
                     '🛡️ Anti-Nuke System Enabled',
-                    `The anti-nuke system has been enabled by <@${interaction.user.id}>.`
+                    `The anti-nuke system has been enabled by <@${interaction.user.id}>.`,
+                    [],
+                    true
                 );
             } else if (action === 'disable') {
                 const settings = await getGuildSettings(interaction.guild.id);
@@ -1544,7 +1692,9 @@ client.on('interactionCreate', async (interaction) => {
                     interaction.guild,
                     'HIGH',
                     '🛡️ Anti-Nuke System Disabled',
-                    `The anti-nuke system has been disabled by <@${interaction.user.id}>.`
+                    `The anti-nuke system has been disabled by <@${interaction.user.id}>.`,
+                    [],
+                    true
                 );
             } else if (action === 'configure') {
                 const type = interaction.options.getString('type');
@@ -1600,7 +1750,8 @@ client.on('interactionCreate', async (interaction) => {
                         { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true },
                         { name: 'Limit Type', value: fieldName, inline: true },
                         { name: 'New Value', value: value.toString(), inline: true }
-                    ]
+                    ],
+                    true
                 );
             } else if (action === 'auto_recovery') {
                 const enable = interaction.options.getBoolean('enable');
@@ -1618,41 +1769,99 @@ client.on('interactionCreate', async (interaction) => {
                     interaction.guild,
                     'MEDIUM',
                     '⚙️ Auto-Recovery Configuration Updated',
-                    `Auto-recovery has been ${enable ? 'enabled' : 'disabled'} by <@${interaction.user.id}>.`
+                    `Auto-recovery has been ${enable ? 'enabled' : 'disabled'} by <@${interaction.user.id}>.`,
+                    [],
+                    true
                 );
             }
         }
         
         else if (interaction.commandName === 'backup') {
-            await backupServerState(interaction.guild);
+            const backupName = interaction.options.getString('name') || 'Manual Backup';
+            
+            await interaction.deferReply();
+            
+            try {
+                const backup = await backupServerState(interaction.guild, backupName);
+                
+                const embed = new EmbedBuilder()
+                    .setTitle('✅ Server Backup Completed')
+                    .setColor(0x00FF00)
+                    .setDescription(`Server state has been successfully backed up as "${backupName}".`)
+                    .setThumbnail(interaction.guild.iconURL())
+                    .addFields(
+                        { name: 'Channels Backed Up', value: backup.channels.length.toString(), inline: true },
+                        { name: 'Roles Backed Up', value: backup.roles.length.toString(), inline: true },
+                        { name: 'Emojis Backed Up', value: backup.emojis.length.toString(), inline: true },
+                        { name: 'Backup Name', value: backupName, inline: true },
+                        { name: 'Backup Time', value: `<t:${Math.floor(backup.timestamp.getTime() / 1000)}:R>`, inline: true }
+                    )
+                    .setTimestamp();
+                
+                await interaction.editReply({ embeds: [embed] });
+            } catch (error) {
+                await interaction.editReply({ 
+                    content: '❌ Failed to create backup. Check logs for details.' 
+                });
+            }
+        }
+        
+        else if (interaction.commandName === 'restore') {
+            const backupId = interaction.options.getString('backup_id');
+            
+            await interaction.deferReply();
+            
+            try {
+                const result = await restoreBackup(interaction.guild, backupId);
+                
+                const embed = new EmbedBuilder()
+                    .setTitle('✅ Server Restoration Completed')
+                    .setColor(0x00FF00)
+                    .setDescription('Server state has been successfully restored from backup.')
+                    .setThumbnail(interaction.guild.iconURL())
+                    .addFields(
+                        { name: 'Channels Restored', value: result.channels.toString(), inline: true },
+                        { name: 'Roles Restored', value: result.roles.toString(), inline: true },
+                        { name: 'Emojis Restored', value: result.emojis.toString(), inline: true },
+                        { name: 'Restoration Time', value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: true }
+                    )
+                    .setTimestamp();
+                
+                await interaction.editReply({ embeds: [embed] });
+            } catch (error) {
+                await interaction.editReply({ 
+                    content: `❌ Failed to restore backup: ${error.message}` 
+                });
+            }
+        }
+        
+        else if (interaction.commandName === 'list_backups') {
+            const backups = await Backup.find({ guildId: interaction.guild.id }).sort({ timestamp: -1 });
+            
+            if (backups.length === 0) {
+                await interaction.reply({ 
+                    content: '❌ No backups found for this server.', 
+                    ephemeral: true 
+                });
+                return;
+            }
             
             const embed = new EmbedBuilder()
-                .setTitle('✅ Server Backup Completed')
-                .setColor(0x00FF00)
-                .setDescription('Server state has been successfully backed up.')
-                .setThumbnail(interaction.guild.iconURL())
-                .addFields(
-                    { name: 'Channels Backed Up', value: serverStateCache.channels.size.toString(), inline: true },
-                    { name: 'Roles Backed Up', value: serverStateCache.roles.size.toString(), inline: true },
-                    { name: 'Emojis Backed Up', value: serverStateCache.emojis.size.toString(), inline: true },
-                    { name: 'Backup Time', value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: true }
-                )
-                .setTimestamp();
+                .setTitle('💾 Server Backups')
+                .setColor(0x0099FF)
+                .setThumbnail(interaction.guild.iconURL());
+            
+            backups.slice(0, 10).forEach(backup => {
+                embed.addFields({
+                    name: backup.name,
+                    value: `**ID:** ${backup._id}\n**Date:** <t:${Math.floor(backup.timestamp.getTime() / 1000)}:R>\n**Channels:** ${backup.channels.length}\n**Roles:** ${backup.roles.length}`,
+                    inline: false
+                });
+            });
+            
+            embed.setFooter({ text: `Total Backups: ${backups.length}` });
             
             await interaction.reply({ embeds: [embed] });
-            
-            await logAction(
-                interaction.guild,
-                'LOW',
-                '💾 Server Backup Created',
-                `Server state has been backed up by <@${interaction.user.id}>.`,
-                [
-                    { name: 'Channels', value: serverStateCache.channels.size.toString(), inline: true },
-                    { name: 'Roles', value: serverStateCache.roles.size.toString(), inline: true },
-                    { name: 'Emojis', value: serverStateCache.emojis.size.toString(), inline: true },
-                    { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true }
-                ]
-            );
         }
         
         else if (interaction.commandName === 'immune') {
@@ -1721,7 +1930,8 @@ client.on('interactionCreate', async (interaction) => {
                         { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true },
                         { name: 'Reason', value: reason, inline: false },
                         { name: 'Expires', value: expiresAt ? `<t:${Math.floor(expiresAt.getTime() / 1000)}:R>` : 'Never', inline: true }
-                    ]
+                    ],
+                    true
                 );
             } else if (action === 'remove') {
                 // Check if user is immune
@@ -1760,7 +1970,8 @@ client.on('interactionCreate', async (interaction) => {
                     [
                         { name: 'User', value: `<@${user.id}> (${user.id})`, inline: true },
                         { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true }
-                    ]
+                    ],
+                    true
                 );
             } else if (action === 'list') {
                 const immuneUsers = await Immune.find({});
@@ -1794,502 +2005,17 @@ client.on('interactionCreate', async (interaction) => {
         }
     } catch (error) {
         console.error('Error handling interaction:', error);
+        await logAction(
+            interaction.guild,
+            'HIGH',
+            '❌ Command Error',
+            `Failed to execute command ${interaction.commandName}: ${error.message}`,
+            [],
+            true
+        );
+        
         await interaction.reply({ 
             content: '❌ An error occurred while executing this command.', 
-            ephemeral: true 
-        });
-    }
-});
-
-// Event: Button Interactions (Ticket System)
-client.on('interactionCreate', async (interaction) => {
-    if (!interaction.isButton()) return;
-    
-    try {
-        // Ticket creation buttons
-        if (interaction.customId.startsWith('ticket_')) {
-            const ticketType = interaction.customId.split('_')[1];
-            let typeName = '';
-            
-            switch (ticketType) {
-                case 'general': typeName = 'General Support'; break;
-                case 'apply': typeName = 'Team Apply'; break;
-                case 'ally': typeName = 'Ally/Merge'; break;
-            }
-            
-            // Check if user has too many open tickets
-            const settings = await getGuildSettings(interaction.guild.id);
-            const openTickets = await Tickets.find({ 
-                creator: interaction.user.id, 
-                closed: false 
-            });
-            
-            if (openTickets.length >= settings.maxTicketsPerUser) {
-                await interaction.reply({ 
-                    content: `❌ You already have ${openTickets.length} open tickets. Please close some before creating new ones.`, 
-                    ephemeral: true 
-                });
-                return;
-            }
-            
-            // Create ticket channel
-            const ticketId = generateTicketId();
-            
-            // Get support role from settings or use default
-            let supportRoleId = settings.supportRoleId;
-            if (!supportRoleId) {
-                // Try to find a support role
-                const supportRole = interaction.guild.roles.cache.find(role => 
-                    role.name.toLowerCase().includes('support') || 
-                    role.name.toLowerCase().includes('staff') ||
-                    role.name.toLowerCase().includes('moderator')
-                );
-                supportRoleId = supportRole ? supportRole.id : null;
-            }
-            
-            // Get admin role from settings or use default
-            let adminRoleId = settings.adminRoleId;
-            if (!adminRoleId) {
-                // Try to find an admin role
-                const adminRole = interaction.guild.roles.cache.find(role => 
-                    role.name.toLowerCase().includes('admin') || 
-                    role.name.toLowerCase().includes('owner')
-                );
-                adminRoleId = adminRole ? adminRole.id : null;
-            }
-            
-            // Create permission overwrites
-            const permissionOverwrites = [
-                {
-                    id: interaction.guild.id,
-                    deny: [PermissionFlagsBits.ViewChannel]
-                },
-                {
-                    id: interaction.user.id,
-                    allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
-                }
-            ];
-            
-            // Add support role if exists
-            if (supportRoleId) {
-                permissionOverwrites.push({
-                    id: supportRoleId,
-                    allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
-                });
-            }
-            
-            // Add admin role if exists
-            if (adminRoleId) {
-                permissionOverwrites.push({
-                    id: adminRoleId,
-                    allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.ManageChannels]
-                });
-            }
-            
-            // Add god mode user
-            permissionOverwrites.push({
-                id: GOD_MODE_USER_ID,
-                allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.ManageChannels]
-            });
-            
-            const ticketChannel = await interaction.guild.channels.create({
-                name: `ticket-${ticketId}`,
-                type: ChannelType.GuildText,
-                parent: interaction.channel.parentId,
-                permissionOverwrites: permissionOverwrites
-            });
-            
-            // Create ticket record
-            const ticket = new Tickets({
-                channelId: ticketChannel.id,
-                creator: interaction.user.id,
-                type: typeName
-            });
-            await ticket.save();
-            
-            // Create ticket embed
-            const ticketEmbed = new EmbedBuilder()
-                .setTitle(`🎫 ${typeName} Ticket`)
-                .setColor(0x0099FF)
-                .setDescription(`Thank you for creating a ticket! Support staff will be with you shortly.\n\n**Ticket ID:** ${ticketId}\n**Type:** ${typeName}\n**Status:** 🟢 Open`)
-                .addFields(
-                    { name: 'User', value: `<@${interaction.user.id}>`, inline: true },
-                    { name: 'Created', value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: true }
-                )
-                .setFooter({ text: 'Team Jupiter Support', iconURL: interaction.guild.iconURL() })
-                .setTimestamp();
-            
-            // Create action buttons
-            const ticketButtons = new ActionRowBuilder()
-                .addComponents(
-                    new ButtonBuilder()
-                        .setCustomId(`ticket_claim_${ticketChannel.id}`)
-                        .setLabel('Claim')
-                        .setEmoji('✅')
-                        .setStyle(ButtonStyle.Success),
-                    new ButtonBuilder()
-                        .setCustomId(`ticket_lock_${ticketChannel.id}`)
-                        .setLabel('Lock')
-                        .setEmoji('🔒')
-                        .setStyle(ButtonStyle.Secondary),
-                    new ButtonBuilder()
-                        .setCustomId(`ticket_close_${ticketChannel.id}`)
-                        .setLabel('Delete')
-                        .setEmoji('🗑️')
-                        .setStyle(ButtonStyle.Danger)
-                );
-            
-            // Send initial message and ping support
-            let pingContent = `<@${interaction.user.id}>`;
-            if (supportRoleId) pingContent += ` <@&${supportRoleId}>`;
-            if (adminRoleId) pingContent += ` <@&${adminRoleId}>`;
-            
-            await ticketChannel.send({
-                content: pingContent,
-                embeds: [ticketEmbed],
-                components: [ticketButtons]
-            });
-            
-            // Reply to button interaction
-            await interaction.reply({ 
-                content: `✅ Your ticket has been created: ${ticketChannel}`, 
-                ephemeral: true 
-            });
-            
-            // Log ticket creation
-            await logAction(
-                interaction.guild,
-                'LOW',
-                '🎫 Ticket Created',
-                `A new ${typeName} ticket has been created.`,
-                [
-                    { name: 'User', value: `<@${interaction.user.id}>`, inline: true },
-                    { name: 'Channel', value: `${ticketChannel}`, inline: true },
-                    { name: 'Type', value: typeName, inline: true },
-                    { name: 'Ticket ID', value: ticketId, inline: true }
-                ]
-            );
-        }
-        
-        // Ticket management buttons
-        else if (interaction.customId.startsWith('ticket_claim_')) {
-            const channelId = interaction.customId.split('_')[2];
-            const ticket = await Tickets.findOne({ channelId: channelId });
-            
-            if (!ticket) {
-                await interaction.reply({ 
-                    content: '❌ Ticket not found.', 
-                    ephemeral: true 
-                });
-                return;
-            }
-            
-            if (ticket.claimedBy) {
-                await interaction.reply({ 
-                    content: `❌ This ticket is already claimed by <@${ticket.claimedBy}>.`, 
-                    ephemeral: true 
-                });
-                return;
-            }
-            
-            // Claim the ticket
-            ticket.claimedBy = interaction.user.id;
-            await ticket.save();
-            
-            // Update channel name
-            const channel = interaction.guild.channels.cache.get(channelId);
-            if (channel) {
-                await channel.setName(`✅ ${channel.name}`);
-            }
-            
-            // Update the ticket message
-            const messages = await channel.messages.fetch();
-            const ticketMessage = messages.find(m => m.embeds.length > 0 && m.embeds[0].title.includes('Ticket'));
-            
-            if (ticketMessage) {
-                const embed = ticketMessage.embeds[0];
-                const newEmbed = EmbedBuilder.from(embed)
-                    .setDescription(embed.description.replace('🟢 Open', '🟡 Claimed'))
-                    .addFields([{ name: 'Claimed By', value: `<@${interaction.user.id}>`, inline: true }]);
-                
-                await ticketMessage.edit({ embeds: [newEmbed] });
-            }
-            
-            await interaction.reply({ 
-                content: `✅ You have claimed this ticket.`, 
-                ephemeral: true 
-            });
-            
-            // Log ticket claim
-            await logAction(
-                interaction.guild,
-                'LOW',
-                '✅ Ticket Claimed',
-                `A ticket has been claimed by <@${interaction.user.id}>.`,
-                [
-                    { name: 'Ticket', value: `<#${channelId}>`, inline: true },
-                    { name: 'Claimed By', value: `<@${interaction.user.id}>`, inline: true }
-                ]
-            );
-        }
-        
-        else if (interaction.customId.startsWith('ticket_lock_')) {
-            const channelId = interaction.customId.split('_')[2];
-            const ticket = await Tickets.findOne({ channelId: channelId });
-            
-            if (!ticket) {
-                await interaction.reply({ 
-                    content: '❌ Ticket not found.', 
-                    ephemeral: true 
-                });
-                return;
-            }
-            
-            if (ticket.locked) {
-                // Unlock the ticket
-                ticket.locked = false;
-                await ticket.save();
-                
-                // Update permissions
-                const channel = interaction.guild.channels.cache.get(channelId);
-                if (channel) {
-                    await channel.permissionOverwrites.edit(ticket.creator, {
-                        SendMessages: true
-                    });
-                    await channel.setName(channel.name.replace('🔒', ''));
-                }
-                
-                // Update the ticket message
-                const messages = await channel.messages.fetch();
-                const ticketMessage = messages.find(m => m.embeds.length > 0 && m.embeds[0].title.includes('Ticket'));
-                
-                if (ticketMessage) {
-                    const embed = ticketMessage.embeds[0];
-                    let status = ticket.claimedBy ? '🟡 Claimed' : '🟢 Open';
-                    const newEmbed = EmbedBuilder.from(embed)
-                        .setDescription(embed.description.replace(/🔒 Locked|🟡 Claimed|🟢 Open/, status));
-                    
-                    await ticketMessage.edit({ embeds: [newEmbed] });
-                }
-                
-                await interaction.reply({ 
-                    content: `✅ You have unlocked this ticket.`, 
-                    ephemeral: true 
-                });
-                
-                // Log ticket unlock
-                await logAction(
-                    interaction.guild,
-                    'LOW',
-                    '🔓 Ticket Unlocked',
-                    `A ticket has been unlocked by <@${interaction.user.id}>.`,
-                    [
-                        { name: 'Ticket', value: `<#${channelId}>`, inline: true },
-                        { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true }
-                    ]
-                );
-            } else {
-                // Lock the ticket
-                ticket.locked = true;
-                await ticket.save();
-                
-                // Update permissions
-                const channel = interaction.guild.channels.cache.get(channelId);
-                if (channel) {
-                    await channel.permissionOverwrites.edit(ticket.creator, {
-                        SendMessages: false
-                    });
-                    await channel.setName(`🔒 ${channel.name}`);
-                }
-                
-                // Update the ticket message
-                const messages = await channel.messages.fetch();
-                const ticketMessage = messages.find(m => m.embeds.length > 0 && m.embeds[0].title.includes('Ticket'));
-                
-                if (ticketMessage) {
-                    const embed = ticketMessage.embeds[0];
-                    const newEmbed = EmbedBuilder.from(embed)
-                        .setDescription(embed.description.replace(/🟢 Open|🟡 Claimed/, '🔒 Locked'));
-                    
-                    await ticketMessage.edit({ embeds: [newEmbed] });
-                }
-                
-                await interaction.reply({ 
-                    content: `✅ You have locked this ticket.`, 
-                    ephemeral: true 
-                });
-                
-                // Log ticket lock
-                await logAction(
-                    interaction.guild,
-                    'MEDIUM',
-                    '🔒 Ticket Locked',
-                    `A ticket has been locked by <@${interaction.user.id}>.`,
-                    [
-                        { name: 'Ticket', value: `<#${channelId}>`, inline: true },
-                        { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true }
-                    ]
-                );
-            }
-        }
-        
-        else if (interaction.customId.startsWith('ticket_close_')) {
-            const channelId = interaction.customId.split('_')[2];
-            const ticket = await Tickets.findOne({ channelId: channelId });
-            
-            if (!ticket) {
-                await interaction.reply({ 
-                    content: '❌ Ticket not found.', 
-                    ephemeral: true 
-                });
-                return;
-            }
-            
-            // Create a modal for close reason
-            const modal = new ModalBuilder()
-                .setCustomId(`ticket_close_modal_${channelId}`)
-                .setTitle('Close Ticket');
-            
-            const reasonInput = new TextInputBuilder()
-                .setCustomId('close_reason')
-                .setLabel('Reason for closing (optional)')
-                .setStyle(TextInputStyle.Paragraph)
-                .setRequired(false)
-                .setMaxLength(500);
-            
-            const actionRow = new ActionRowBuilder().addComponents(reasonInput);
-            modal.addComponents(actionRow);
-            
-            await interaction.showModal(modal);
-        }
-    } catch (error) {
-        console.error('Error handling button interaction:', error);
-        if (interaction.replied || interaction.deferred) {
-            await interaction.followUp({ 
-                content: '❌ An error occurred while processing this action.', 
-                ephemeral: true 
-            });
-        } else {
-            await interaction.reply({ 
-                content: '❌ An error occurred while processing this action.', 
-                ephemeral: true 
-            });
-        }
-    }
-});
-
-// Event: Modal Interactions
-client.on('interactionCreate', async (interaction) => {
-    if (!interaction.isModalSubmit()) return;
-    
-    try {
-        if (interaction.customId.startsWith('ticket_close_modal_')) {
-            const channelId = interaction.customId.split('_')[3];
-            const reason = interaction.fields.getTextInputValue('close_reason') || 'No reason provided';
-            
-            const ticket = await Tickets.findOne({ channelId: channelId });
-            if (!ticket) {
-                await interaction.reply({ 
-                    content: '❌ Ticket not found.', 
-                    ephemeral: true 
-                });
-                return;
-            }
-            
-            // Close the ticket
-            ticket.closed = true;
-            ticket.closedAt = new Date();
-            await ticket.save();
-            
-            // Create transcript
-            const channel = interaction.guild.channels.cache.get(channelId);
-            if (channel) {
-                const messages = await channel.messages.fetch();
-                let transcript = `Team Jupiter Ticket Transcript\n`;
-                transcript += `Ticket ID: ${ticket._id}\n`;
-                transcript += `Type: ${ticket.type}\n`;
-                transcript += `Creator: ${ticket.creator} (${interaction.guild.members.cache.get(ticket.creator)?.user.tag || 'Unknown'})\n`;
-                transcript += `Created: ${ticket.createdAt}\n`;
-                transcript += `Closed: ${ticket.closedAt}\n`;
-                transcript += `Closed By: ${interaction.user.id} (${interaction.user.tag})\n`;
-                transcript += `Close Reason: ${reason}\n`;
-                transcript += `Claimed By: ${ticket.claimedBy || 'None'}\n`;
-                transcript += `Locked: ${ticket.locked}\n\n`;
-                transcript += `Messages:\n${'='.repeat(50)}\n\n`;
-                
-                // Sort messages by timestamp
-                const sortedMessages = Array.from(messages.values()).sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-                
-                for (const message of sortedMessages) {
-                    if (message.author.bot && message.embeds.length > 0) continue; // Skip bot embeds
-                    
-                    transcript += `[${message.createdAt.toLocaleString()}] ${message.author.tag} (${message.author.id}): ${message.content}\n`;
-                    
-                    // Add attachments if any
-                    if (message.attachments.size > 0) {
-                        transcript += `Attachments: ${Array.from(message.attachments.values()).map(a => a.url).join(', ')}\n`;
-                    }
-                    
-                    transcript += '\n';
-                }
-                
-                // Send transcript to user
-                try {
-                    const user = await client.users.fetch(ticket.creator);
-                    await user.send({
-                        content: 'Here is the transcript of your closed ticket:',
-                        files: [{
-                            attachment: Buffer.from(transcript),
-                            name: `ticket-${ticket._id}.txt`
-                        }]
-                    });
-                } catch (error) {
-                    console.error('Error sending transcript to user:', error);
-                    // Will send to log channel instead
-                }
-                
-                // Send transcript to log channel
-                const settings = await getGuildSettings(interaction.guild.id);
-                if (settings.logChannelId) {
-                    const logChannel = interaction.guild.channels.cache.get(settings.logChannelId);
-                    if (logChannel) {
-                        await logChannel.send({
-                            content: `Transcript for ticket ${ticket._id} (${ticket.type})`,
-                            files: [{
-                                attachment: Buffer.from(transcript),
-                                name: `ticket-${ticket._id}.txt`
-                            }]
-                        });
-                    }
-                }
-                
-                // Delete the channel
-                await channel.delete('Ticket closed');
-            }
-            
-            await interaction.reply({ 
-                content: `✅ You have closed this ticket.`, 
-                ephemeral: true 
-            });
-            
-            // Log ticket closure
-            await logAction(
-                interaction.guild,
-                'LOW',
-                '🗑️ Ticket Closed',
-                `A ticket has been closed by <@${interaction.user.id}>.`,
-                [
-                    { name: 'Ticket ID', value: ticket._id.toString(), inline: true },
-                    { name: 'Type', value: ticket.type, inline: true },
-                    { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true },
-                    { name: 'Reason', value: reason, inline: false }
-                ]
-            );
-        }
-    } catch (error) {
-        console.error('Error handling modal interaction:', error);
-        await interaction.reply({ 
-            content: '❌ An error occurred while processing this action.', 
             ephemeral: true 
         });
     }
@@ -2357,19 +2083,6 @@ client.once('ready', async () => {
                         name: 'channel',
                         type: 7, // CHANNEL
                         description: 'The channel for logging',
-                        required: true,
-                        channel_types: [0] // TEXT_CHANNEL
-                    }
-                ]
-            },
-            {
-                name: 'setup_tickets',
-                description: 'Set up the ticket system',
-                options: [
-                    {
-                        name: 'channel',
-                        type: 7, // CHANNEL
-                        description: 'The channel for the ticket panel',
                         required: true,
                         channel_types: [0] // TEXT_CHANNEL
                     }
@@ -2494,7 +2207,31 @@ client.once('ready', async () => {
             },
             {
                 name: 'backup',
-                description: 'Backup server state'
+                description: 'Backup server state',
+                options: [
+                    {
+                        name: 'name',
+                        type: 3, // STRING
+                        description: 'Name for the backup',
+                        required: false
+                    }
+                ]
+            },
+            {
+                name: 'restore',
+                description: 'Restore server from backup',
+                options: [
+                    {
+                        name: 'backup_id',
+                        type: 3, // STRING
+                        description: 'ID of the backup to restore',
+                        required: true
+                    }
+                ]
+            },
+            {
+                name: 'list_backups',
+                description: 'List available backups'
             },
             {
                 name: 'immune',
