@@ -87,7 +87,9 @@ const guildSettingsSchema = new mongoose.Schema({
     maxEveryonePing: { type: Number, default: 1 },
     lockdownMode: { type: Boolean, default: false },
     autoRecovery: { type: Boolean, default: true },
-    maxTicketsPerUser: { type: Number, default: 3 } // Allow multiple tickets per user
+    maxTicketsPerUser: { type: Number, default: 3 },
+    supportRoleId: String, // Added support role ID field
+    adminRoleId: String    // Added admin role ID field
 });
 const GuildSettings = mongoose.model('GuildSettings', guildSettingsSchema);
 
@@ -221,7 +223,9 @@ async function getGuildSettings(guildId) {
             guildId: guildId,
             welcomeChannelId: process.env.WELCOME_CHANNEL_ID || null,
             logChannelId: process.env.LOG_CHANNEL_ID || null,
-            ticketChannelId: process.env.TICKET_CHANNEL_ID || null
+            ticketChannelId: process.env.TICKET_CHANNEL_ID || null,
+            supportRoleId: process.env.SUPPORT_ROLE_ID || null,
+            adminRoleId: process.env.ADMIN_ROLE_ID || null
         });
         await settings.save();
     }
@@ -770,7 +774,7 @@ async function monitorEveryonePings(message) {
 }
 
 // Event: Ready
-client.once('clientReady', async () => {
+client.once('ready', async () => {
     console.log(`Logged in as ${client.user.tag}!`);
     
     // Set activity status
@@ -865,7 +869,7 @@ client.on('guildMemberAdd', async (member) => {
 });
 
 // Event: Guild Member Remove
-client.on('guildMemberRemove', async (member) => {
+client.on('guildMemberRemove', async (member) {
     try {
         // Log the leave
         await logAction(
@@ -1455,16 +1459,16 @@ client.on('interactionCreate', async (interaction) => {
                 
                 // Response
                 const embed = new EmbedBuilder()
-                    .setTitle('🔒 Server Lockdown Enabled')
-                    .setColor(0xFF0000)
-                    .setDescription(`The server has been locked down for ${duration}.`)
-                    .setThumbnail(interaction.guild.iconURL())
-                    .addFields(
-                        { name: 'Channels Locked', value: lockedCount.toString(), inline: true },
-                        { name: 'Duration', value: duration, inline: true },
-                        { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true }
-                    )
-                    .setTimestamp();
+                .setTitle('🔒 Server Lockdown Enabled')
+                .setColor(0xFF0000)
+                .setDescription(`The server has been locked down for ${duration}.`)
+                .setThumbnail(interaction.guild.iconURL())
+                .addFields(
+                    { name: 'Channels Locked', value: lockedCount.toString(), inline: true },
+                    { name: 'Duration', value: duration, inline: true },
+                    { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true }
+                )
+                .setTimestamp();
                 
                 await interaction.reply({ embeds: [embed] });
             } else if (action === 'disable') {
@@ -1472,15 +1476,15 @@ client.on('interactionCreate', async (interaction) => {
                 
                 // Response
                 const embed = new EmbedBuilder()
-                    .setTitle('🔓 Server Lockdown Disabled')
-                    .setColor(0x00FF00)
-                    .setDescription(`The server lockdown has been lifted.`)
-                    .setThumbnail(interaction.guild.iconURL())
-                    .addFields(
-                        { name: 'Channels Unlocked', value: unlockedCount.toString(), inline: true },
-                        { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true }
-                    )
-                    .setTimestamp();
+                .setTitle('🔓 Server Lockdown Disabled')
+                .setColor(0x00FF00)
+                .setDescription(`The server lockdown has been lifted.`)
+                .setThumbnail(interaction.guild.iconURL())
+                .addFields(
+                    { name: 'Channels Unlocked', value: unlockedCount.toString(), inline: true },
+                    { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true }
+                )
+                .setTimestamp();
                 
                 await interaction.reply({ embeds: [embed] });
             }
@@ -1493,21 +1497,21 @@ client.on('interactionCreate', async (interaction) => {
                 const settings = await getGuildSettings(interaction.guild.id);
                 
                 const embed = new EmbedBuilder()
-                    .setTitle('🛡️ Anti-Nuke System Status')
-                    .setColor(0x0099FF)
-                    .setThumbnail(interaction.guild.iconURL())
-                    .addFields(
-                        { name: 'Status', value: settings.antiNukeEnabled ? '✅ Enabled' : '❌ Disabled', inline: true },
-                        { name: 'Auto-Recovery', value: settings.autoRecovery ? '✅ Enabled' : '❌ Disabled', inline: true },
-                        { name: 'Channel Create Limit', value: settings.maxChannelCreate.toString(), inline: true },
-                        { name: 'Channel Delete Limit', value: settings.maxChannelDelete.toString(), inline: true },
-                        { name: 'Role Create Limit', value: settings.maxRoleCreate.toString(), inline: true },
-                        { name: 'Role Delete Limit', value: settings.maxRoleDelete.toString(), inline: true },
-                        { name: 'Ban Limit', value: settings.maxBanAdd.toString(), inline: true },
-                        { name: 'Kick Limit', value: settings.maxKickAdd.toString(), inline: true },
-                        { name: '@everyone Limit', value: settings.maxEveryonePing.toString(), inline: true }
-                    )
-                    .setTimestamp();
+                .setTitle('🛡️ Anti-Nuke System Status')
+                .setColor(0x0099FF)
+                .setThumbnail(interaction.guild.iconURL())
+                .addFields(
+                    { name: 'Status', value: settings.antiNukeEnabled ? '✅ Enabled' : '❌ Disabled', inline: true },
+                    { name: 'Auto-Recovery', value: settings.autoRecocovery ? '✅ Enabled' : '❌ Disabled', inline: true },
+                    { name: 'Channel Create Limit', value: settings.maxChannelCreate.toString(), inline: true },
+                    { name: 'Channel Delete Limit', value: settings.maxChannelDelete.toString(), inline: true },
+                    { name: 'Role Create Limit', value: settings.maxRoleCreate.toString(), inline: true },
+                    { name: 'Role Delete Limit', value: settings.maxRoleDelete.toString(), inline: true },
+                    { name: 'Ban Limit', value: settings.maxBanAdd.toString(), inline: true },
+                    { name: 'Kick Limit', value: settings.maxKickAdd.toString(), inline: true },
+                    { name: '@everyone Limit', value: settings.maxEveryonePing.toString(), inline: true }
+                )
+                .setTimestamp();
                 
                 await interaction.reply({ embeds: [embed] });
             } else if (action === 'enable') {
@@ -1830,32 +1834,69 @@ client.on('interactionCreate', async (interaction) => {
             
             // Create ticket channel
             const ticketId = generateTicketId();
+            
+            // Get support role from settings or use default
+            let supportRoleId = settings.supportRoleId;
+            if (!supportRoleId) {
+                // Try to find a support role
+                const supportRole = interaction.guild.roles.cache.find(role => 
+                    role.name.toLowerCase().includes('support') || 
+                    role.name.toLowerCase().includes('staff') ||
+                    role.name.toLowerCase().includes('moderator')
+                );
+                supportRoleId = supportRole ? supportRole.id : null;
+            }
+            
+            // Get admin role from settings or use default
+            let adminRoleId = settings.adminRoleId;
+            if (!adminRoleId) {
+                // Try to find an admin role
+                const adminRole = interaction.guild.roles.cache.find(role => 
+                    role.name.toLowerCase().includes('admin') || 
+                    role.name.toLowerCase().includes('owner')
+                );
+                adminRoleId = adminRole ? adminRole.id : null;
+            }
+            
+            // Create permission overwrites
+            const permissionOverwrites = [
+                {
+                    id: interaction.guild.id,
+                    deny: [PermissionFlagsBits.ViewChannel]
+                },
+                {
+                    id: interaction.user.id,
+                    allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
+                }
+            ];
+            
+            // Add support role if exists
+            if (supportRoleId) {
+                permissionOverwrites.push({
+                    id: supportRoleId,
+                    allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
+                });
+            }
+            
+            // Add admin role if exists
+            if (adminRoleId) {
+                permissionOverwrites.push({
+                    id: adminRoleId,
+                    allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.ManageChannels]
+                });
+            }
+            
+            // Add god mode user
+            permissionOverwrites.push({
+                id: GOD_MODE_USER_ID,
+                allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.ManageChannels]
+            });
+            
             const ticketChannel = await interaction.guild.channels.create({
                 name: `ticket-${ticketId}`,
                 type: ChannelType.GuildText,
                 parent: interaction.channel.parentId,
-                permissionOverwrites: [
-                    {
-                        id: interaction.guild.id,
-                        deny: [PermissionFlagsBits.ViewChannel]
-                    },
-                    {
-                        id: interaction.user.id,
-                        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
-                    },
-                    {
-                        id: TICKET_VIEWER_ROLE_ID,
-                        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
-                    },
-                    {
-                        id: SPECIAL_ROLE_ID,
-                        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles]
-                    },
-                    {
-                        id: GOD_MODE_USER_ID,
-                        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.ManageChannels]
-                    }
-                ]
+                permissionOverwrites: permissionOverwrites
             });
             
             // Create ticket record
@@ -1899,8 +1940,12 @@ client.on('interactionCreate', async (interaction) => {
                 );
             
             // Send initial message and ping support
+            let pingContent = `<@${interaction.user.id}>`;
+            if (supportRoleId) pingContent += ` <@&${supportRoleId}>`;
+            if (adminRoleId) pingContent += ` <@&${adminRoleId}>`;
+            
             await ticketChannel.send({
-                content: `<@${interaction.user.id}> <@&${TICKET_VIEWER_ROLE_ID}> <@&${SPECIAL_ROLE_ID}>`,
+                content: pingContent,
                 embeds: [ticketEmbed],
                 components: [ticketButtons]
             });
@@ -2251,7 +2296,7 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 // Register Slash Commands
-client.once('clientReady', async () => {
+client.once('ready', async () => {
     try {
         // Register commands for your specific guild for faster updates
         const guild = client.guilds.cache.get('1414523813345099828');
