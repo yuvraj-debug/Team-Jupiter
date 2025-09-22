@@ -869,7 +869,7 @@ client.on('guildMemberAdd', async (member) => {
 });
 
 // Event: Guild Member Remove
-client.on('guildMemberRemove', async (member) {
+client.on('guildMemberRemove', async (member) => {
     try {
         // Log the leave
         await logAction(
